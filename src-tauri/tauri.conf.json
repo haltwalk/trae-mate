@@ -1,6 +1,6 @@
 {
   "$schema": "./gen/schemas/desktop-schema.json",
-  "productName": "TraeCheck",
+  "productName": "TraeMate",
   "version": "1.0.0",
   "identifier": "com.traecheck.app",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "TraeCheck - 每日自动签到",
+        "title": "TraeMate - 签到与多开账号管理",
         "width": 1100,
         "height": 750,
         "minWidth": 900,

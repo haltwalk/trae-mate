@@ -4498,7 +4498,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "trae-check"
+name = "trae-mate"
 version = "1.0.0"
 dependencies = [
  "aes",

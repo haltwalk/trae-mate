@@ -1,9 +1,9 @@
 {
-  "name": "trae-check",
+  "name": "trae-mate",
   "version": "1.0.0",
-  "description": "Trae Work 每日自动签到工具 - Tauri2 版",
+  "description": "Trae Work 签到与多开账号管理 - Tauri2 版",
   "type": "module",
-  "author": "trae-check",
+  "author": "traemate",
   "license": "MIT",
   "scripts": {
     "dev": "vite",

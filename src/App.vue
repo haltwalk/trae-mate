@@ -16,9 +16,9 @@
       <div class="sidebar-header">
         <div class="logo">
           <span class="logo-icon"><Icon name="check" :size="20" /></span>
-          <span class="logo-text">TraeCheck</span>
+          <span class="logo-text">TraeMate</span>
         </div>
-        <p class="logo-desc">每日自动签到工具</p>
+        <p class="logo-desc">签到与多开账号管理</p>
       </div>
 
       <nav class="nav-menu">
@@ -169,7 +169,7 @@ function toggleTheme() {
   isDark.value = !isDark.value
   const theme = isDark.value ? 'dark' : 'light'
   document.documentElement.dataset.theme = theme
-  localStorage.setItem('trae-check-theme', theme)
+  localStorage.setItem('traemate-theme', theme)
 }
 
 const currentPageTitle = computed(() => {

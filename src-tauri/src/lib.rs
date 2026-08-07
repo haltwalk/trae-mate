@@ -102,7 +102,7 @@ pub fn run() {
                 .expect("默认窗口图标缺失,无法创建托盘");
             TrayIconBuilder::with_id("main-tray")
                 .icon(tray_icon)
-                .tooltip("TraeCheck - 每日自动签到")
+                .tooltip("TraeMate - 签到与多开账号管理")
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
                     let id = event.id.as_ref();

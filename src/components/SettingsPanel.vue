@@ -252,7 +252,7 @@
 
     <div class="settings-section card">
       <h3 class="section-title">关于</h3>
-      <p class="section-desc">TraeCheck · TRAE Work 桌面账号签到助手</p>
+      <p class="section-desc">TraeMate · TRAE Work 签到与多开账号管理</p>
       <p class="section-desc">支持多账号凭证管理、自动签到、签到后总积分刷新和账号显示名称编辑。凭证仅保存在本机，用于调用 TRAE 桌面接口。</p>
 
       <div class="about-info">
