@@ -1,0 +1,35 @@
+{
+  "$schema": "./gen/schemas/desktop-schema.json",
+  "productName": "TraeCheck",
+  "version": "1.0.0",
+  "identifier": "com.traecheck.app",
+  "build": {
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TraeCheck - 每日自动签到",
+        "width": 1100,
+        "height": 750,
+        "minWidth": 900,
+        "minHeight": 600,
+        "decorations": false,
+        "backgroundColor": "#0b0d1a"
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico", "icons/icon.png"]
+  }
+}

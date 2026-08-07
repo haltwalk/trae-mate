@@ -1,0 +1,464 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* ============================================================
+   Neumorphism Token System
+   技能规范:元素背景必须 = --surface;禁用 border;双阴影(左上亮/右下暗);
+   强调色仅用于激活态/进度/主按钮;跟随系统明暗双主题。
+   ============================================================ */
+:root {
+  /* 表面色 - Light (Stone Gray #e0e5ec) - 一切元素都建立在此色之上 */
+  --surface: #e0e5ec;
+  --surface-deep: #d1d9e6;   /* 凹陷区域 */
+  --surface-raised: #e8edf4; /* 高亮区域 */
+
+  /* 双阴影 - 光源左上方:亮阴影朝左上,暗阴影朝右下 */
+  --shadow-light: rgba(255, 255, 255, 0.80);
+  --shadow-dark: rgba(163, 177, 198, 0.60);
+
+  /* 阴影组合(Soft 强度):raised 凸起 / flat 平面 / inset 凹陷 */
+  --shadow-soft-raised: -6px -6px 14px var(--shadow-light), 6px 6px 14px var(--shadow-dark);
+  --shadow-soft-flat: -2px -2px 5px var(--shadow-light), 2px 2px 5px var(--shadow-dark);
+  --shadow-soft-inset: inset -4px -4px 10px var(--shadow-light), inset 4px 4px 10px var(--shadow-dark);
+  --shadow-md-raised: -8px -8px 18px var(--shadow-light), 8px 8px 18px var(--shadow-dark);
+  --shadow-md-inset: inset -6px -6px 14px var(--shadow-light), inset 6px 6px 14px var(--shadow-dark);
+  --shadow-bold-raised: -12px -12px 24px var(--shadow-light), 12px 12px 24px var(--shadow-dark);
+
+  /* 强调色 - Teal(仅激活态/进度/主 CTA) */
+  --accent: #00b4d8;
+  --accent-deep: #0090b5;
+  --accent-light: rgba(0, 180, 216, 0.20);
+  --accent-glow: 0 0 12px rgba(0, 180, 216, 0.30);
+
+  /* 业务状态色(仅文字与小徽章,不作大面积填充,保持 90% 无色) */
+  --success: #059669;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --info: var(--accent);
+
+  /* 文字 */
+  --text-primary: #4a5568;
+  --text-secondary: #718096;
+  --text-muted: #a0aec0;
+  --text-accent: var(--accent);
+
+  /* 圆角 */
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --r-xl: 28px;
+  --r-pill: 999px;
+
+  /* 过渡 */
+  --t-press: 0.12s cubic-bezier(0.4, 0, 0.2, 1);
+  --t-lift: 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+  --t-smooth: 0.25s ease;
+
+  /* 兼容旧变量名(指向新 token,降低迁移风险) */
+  --primary-color: var(--accent);
+  --primary-hover: var(--accent-deep);
+  --primary-deep: var(--accent-deep);
+  --primary-glow: var(--accent-glow);
+  --primary-light: var(--accent-light);
+  --success-color: var(--success);
+  --warning-color: var(--warning);
+  --danger-color: var(--danger);
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+  --border-color: transparent;
+}
+
+/* Dark 模式 (Midnight #1e2228) - 由 data-theme 控制(main.ts 读取 localStorage 或系统偏好设置) */
+:root[data-theme="dark"] {
+  --surface: #1e2228;
+  --surface-deep: #181c22;
+  --surface-raised: #252b33;
+
+  --shadow-light: rgba(50, 60, 75, 0.70);
+  --shadow-dark: rgba(0, 0, 0, 0.50);
+
+  --accent: #00b4d8;
+  --accent-deep: #00b4d8;
+  --accent-light: rgba(0, 180, 216, 0.22);
+  --accent-glow: 0 0 14px rgba(0, 180, 216, 0.35);
+
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+
+  --text-primary: #c8d0e7;
+  --text-secondary: #8892a4;
+  --text-muted: #5a6478;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background-color: var(--surface);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* 标题字体 - Nunito 几何圆角,呼应软质感 */
+h1, h2, h3, h4 {
+  font-family: 'Nunito', 'Inter', -apple-system, sans-serif;
+}
+
+#app {
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* 滚动条 - Neumorphism 凹槽质感 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--shadow-dark);
+  border-radius: var(--r-pill);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* ============================================================
+   基础组件类
+   ============================================================ */
+
+/* 卡片 - 凸起 */
+.card,
+.glass {
+  background: var(--surface);
+  border: none;
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-soft-raised);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* 按钮 - 凸起 -> 按下凹陷 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 18px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: none;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: var(--shadow-soft-raised);
+  transition: box-shadow var(--t-press), transform var(--t-press), color var(--t-smooth), filter var(--t-smooth);
+}
+
+.btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  box-shadow: var(--shadow-md-raised);
+}
+
+.btn:active:not(:disabled) {
+  box-shadow: var(--shadow-soft-inset);
+  transform: scale(0.98);
+  color: var(--accent);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: var(--shadow-soft-flat);
+}
+
+/* 主 CTA - 强调色填充(刻意打破软质感以形成对比) */
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  box-shadow: var(--shadow-soft-flat), var(--accent-glow);
+}
+
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+  color: #fff;
+  box-shadow: 0 4px 16px rgba(0, 180, 216, 0.4);
+}
+
+.btn-primary:active:not(:disabled) {
+  transform: scale(0.97);
+  box-shadow: var(--shadow-soft-inset);
+}
+
+/* 次按钮 - 同默认凸起 */
+.btn-secondary {
+  background: var(--surface);
+  color: var(--text-secondary);
+}
+
+/* 轮廓按钮 - 更轻的平面阴影 */
+.btn-outline {
+  background: var(--surface);
+  color: var(--text-secondary);
+  box-shadow: var(--shadow-soft-flat);
+}
+
+.btn-outline:hover:not(:disabled) {
+  color: var(--text-primary);
+  box-shadow: var(--shadow-soft-raised);
+}
+
+.btn-outline:active:not(:disabled) {
+  box-shadow: var(--shadow-soft-inset);
+}
+
+/* 状态色按钮(业务保留,小面积填充) */
+.btn-success {
+  background: var(--success);
+  color: #fff;
+  font-weight: 700;
+  box-shadow: var(--shadow-soft-flat), 0 0 12px rgba(5, 150, 105, 0.3);
+}
+
+.btn-success:hover:not(:disabled) {
+  filter: brightness(1.06);
+  color: #fff;
+}
+
+.btn-success:active:not(:disabled) {
+  transform: scale(0.97);
+  box-shadow: var(--shadow-soft-inset);
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: #fff;
+  font-weight: 700;
+  box-shadow: var(--shadow-soft-flat), 0 0 12px rgba(220, 38, 38, 0.3);
+}
+
+.btn-danger:hover:not(:disabled) {
+  filter: brightness(1.06);
+  color: #fff;
+}
+
+.btn-danger:active:not(:disabled) {
+  transform: scale(0.97);
+  box-shadow: var(--shadow-soft-inset);
+}
+
+.btn-sm {
+  padding: 7px 12px;
+  font-size: 12px;
+}
+
+.btn-lg {
+  padding: 13px 24px;
+  font-size: 16px;
+}
+
+/* 输入框 - 凹陷 */
+.input {
+  width: 100%;
+  padding: 11px 14px;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text-primary);
+  background: var(--surface);
+  border: none;
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-soft-inset);
+  outline: none;
+  transition: box-shadow var(--t-smooth);
+}
+
+.input:focus {
+  box-shadow: var(--shadow-soft-inset), 0 0 0 3px var(--accent-light);
+}
+
+.input::placeholder {
+  color: var(--text-muted);
+}
+
+.input:disabled {
+  opacity: 0.5;
+}
+
+/* 标签页 - 凹槽容器 + 凸起激活项 */
+.tabs {
+  display: flex;
+  gap: 6px;
+  padding: 5px;
+  background: var(--surface);
+  border: none;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-soft-inset);
+}
+
+.tab {
+  padding: 8px 16px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  border-radius: var(--r-sm);
+  transition: all var(--t-smooth);
+}
+
+.tab:hover {
+  color: var(--text-primary);
+}
+
+.tab.active {
+  color: var(--accent);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft-raised);
+}
+
+/* 状态徽章 - 小凸起药丸,文字色区分状态(无强色块) */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: var(--r-pill);
+  border: none;
+  background: var(--surface);
+  box-shadow: var(--shadow-soft-flat);
+  color: var(--text-secondary);
+}
+
+.badge-success {
+  color: var(--success);
+}
+
+.badge-warning {
+  color: var(--warning);
+}
+
+.badge-danger {
+  color: var(--danger);
+}
+
+.badge-info {
+  color: var(--accent);
+}
+
+.badge-muted {
+  color: var(--text-muted);
+}
+
+/* 开关 - 凹槽轨道 + 凸起滑块,激活时滑块变强调色 */
+.switch {
+  position: relative;
+  width: 48px;
+  height: 26px;
+  background: var(--surface);
+  border: none;
+  border-radius: var(--r-pill);
+  box-shadow: var(--shadow-soft-inset);
+  cursor: pointer;
+  transition: box-shadow var(--t-smooth);
+  flex-shrink: 0;
+}
+
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: var(--shadow-soft-raised);
+  transition: transform var(--t-lift), background var(--t-smooth), box-shadow var(--t-smooth);
+}
+
+.switch.active::after {
+  transform: translateX(22px);
+  background: var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 180, 216, 0.45);
+}
+
+/* 加载旋转(spinner 用于主按钮内,白圈白顶) */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* 空状态 */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.empty-state-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+.empty-state-text {
+  font-size: 15px;
+  color: var(--text-secondary);
+}
+
+.empty-state-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+/* 降低动效偏好 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

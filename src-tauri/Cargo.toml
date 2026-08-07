@@ -1,0 +1,32 @@
+[package]
+name = "trae-check"
+version = "1.0.0"
+description = "Trae Work 每日自动签到工具 - Tauri2 版"
+authors = ["trae-check"]
+edition = "2021"
+
+[lib]
+name = "trae_check_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+aes = "0.8"
+cbc = "0.1"
+sha2 = { version = "0.10", features = ["oid"] }
+base64 = "0.22"
+chrono = "0.4"
+windows = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_System_Memory", "Win32_Foundation"] }
+rsa = "0.9"
+rand = "0.8"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
+tauri-plugin-notification = "2"
+chrono-tz = "0.10"

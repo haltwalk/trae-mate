@@ -1,0 +1,40 @@
+# ---- Node / pnpm ----
+node_modules/
+.pnpm-store/
+dist/
+dist-ssr/
+*.local
+
+# ---- Vite ----
+.vite/
+
+# ---- Rust / Tauri ----
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# ---- Logs ----
+*.log
+.tauri-dev.log
+build.log
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- Env ----
+.env
+.env.local
+.env.*.local
+
+# ---- Local Claude state ----
+.claude/
+
+# ---- Legacy backup (has its own git repo) ----
+trae-check-orig/
