@@ -12,6 +12,8 @@ TraeMate 是一款 Trae Work 桌面客户端的辅助工具,提供:
 - **动态托盘菜单**:系统托盘右键菜单按账号分组,快捷聚焦各多开实例窗口
 - **Neumorphism UI**:跟随系统明暗(默认夜间模式)+ Teal 强调色
 
+![TraeMate 首页](docs/home.png)
+
 ## 技术栈
 
 - 前端:Vue 3 + Pinia + Vite + TypeScript(Neumorphism / Soft UI 风格)
