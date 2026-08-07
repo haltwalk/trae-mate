@@ -17,8 +17,8 @@ use tauri::{
     AppHandle, Emitter, Manager,
 };
 
-/// 重建系统托盘右键菜单:动态列出正在运行的多开账号(点击聚焦其窗口)+ 一键签到 + 退出。
-/// 在启动、多开/删除账号、以及定时(感知外部关闭)时调用。
+/// 重建系统托盘右键菜单:列出全部账号(● 运行中 / ○ 未运行,点击启动或聚焦)+ 一键签到 + 退出。
+/// 在启动、删除账号、以及定时(感知外部关闭)时调用。
 pub fn rebuild_tray_menu(app: &AppHandle) {
     let accounts = {
         let state = app.state::<store::AppState>();
@@ -26,35 +26,32 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
         accounts
     };
 
-    // 正在运行的多开账号(有 data_dir 且实例存活)
-    let running: Vec<_> = accounts
-        .iter()
-        .filter(|a| {
-            a.data_dir
-                .as_deref()
-                .map_or(false, |d| !d.is_empty() && trae_machine::is_instance_running(d).0)
-        })
-        .collect();
-
     let menu = match Menu::new(app) {
         Ok(m) => m,
         Err(_) => return,
     };
 
-    // 多开账号:标题分组(disabled 的标题项作分组头,账号项平铺其下)
-    if !running.is_empty() {
+    // 账号列表:列出全部账号(★ 主实例 / ● 工具实例 / ○ 未运行),点击聚焦或启动
+    if !accounts.is_empty() {
+        let main = trae_machine::probe_main_instance();
         if let Ok(header) =
-            MenuItem::with_id(app, "tray_header", "多开账号", false, None::<&str>)
+            MenuItem::with_id(app, "tray_header", "账号列表", false, None::<&str>)
         {
             let _ = menu.append(&header);
         }
-        for a in &running {
-            let id_str = format!("tray_focus_{}", a.id);
-            let title = if a.name.trim().is_empty() {
-                format!("  {}", a.id)
-            } else {
-                format!("  {}", a.name)
+        for a in &accounts {
+            let prefix = match trae_machine::account_state(a, &main) {
+                trae_machine::InstanceSource::Main => "★",
+                trae_machine::InstanceSource::Tool => "●",
+                trae_machine::InstanceSource::None => "○",
             };
+            let id_str = format!("tray_account_{}", a.id);
+            let name = if a.name.trim().is_empty() {
+                a.id.clone()
+            } else {
+                a.name.clone()
+            };
+            let title = format!("{} {}", prefix, name);
             if let Ok(item) =
                 MenuItem::with_id(app, id_str.as_str(), title.as_str(), true, None::<&str>)
             {
@@ -89,6 +86,10 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .setup(|app| {
             // 存储路径:<app_data_dir>/trae-check-data.json
             let app_data = app.path().app_data_dir()?;
@@ -102,7 +103,15 @@ pub fn run() {
             app.manage(reqwest::Client::new());
             app.manage(scheduler::SchedulerState::default());
 
-            // 系统托盘:左键单击显示窗口;右键菜单(动态:多开账号聚焦 + 一键签到 + 退出)由 rebuild_tray_menu 维护
+            // 静默启动:--minimized 时保持主窗口隐藏到托盘(tauri.conf visible:false 配合,避免闪烁)
+            let minimized = std::env::args().any(|a| a == "--minimized");
+            if !minimized {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                }
+            }
+
+            // 系统托盘:左键单击显示窗口;右键菜单(动态:账号列表启动/聚焦 + 一键签到 + 退出)由 rebuild_tray_menu 维护
             let tray_icon = app
                 .default_window_icon()
                 .cloned()
@@ -125,20 +134,62 @@ pub fn run() {
                         "tray_quit" => {
                             app.exit(0);
                         }
-                        // 点击多开账号项:聚焦其 TRAE 实例窗口
-                        s if s.starts_with("tray_focus_") => {
-                            let account_id = &s["tray_focus_".len()..];
-                            let state = app.state::<store::AppState>();
-                            let data_dir = {
+                        // 点击账号项:主/工具实例运行则聚焦对应窗口,未运行则启动
+                        s if s.starts_with("tray_account_") => {
+                            let account_id = s["tray_account_".len()..].to_string();
+                            let account = {
+                                let state = app.state::<store::AppState>();
                                 let data = state.data.lock().unwrap();
                                 data.get_accounts()
                                     .iter()
                                     .find(|a| a.id == account_id)
-                                    .and_then(|a| a.data_dir.clone())
+                                    .cloned()
                             };
-                            if let Some(d) = data_dir {
-                                if let Err(e) = trae_machine::focus_instance_window(&d) {
-                                    eprintln!("[tray] 聚焦账号 {} 失败: {}", account_id, e);
+                            let account = match account {
+                                Some(a) => a,
+                                None => return, // 账号已不存在,忽略
+                            };
+                            let main = trae_machine::probe_main_instance();
+                            match trae_machine::account_state(&account, &main) {
+                                trae_machine::InstanceSource::Tool => {
+                                    if let Some(d) =
+                                        account.data_dir.as_deref().filter(|s| !s.is_empty())
+                                    {
+                                        if let Err(e) = trae_machine::focus_instance_window(d) {
+                                            eprintln!(
+                                                "[tray] 聚焦账号 {} 工具实例失败: {}",
+                                                account_id, e
+                                            );
+                                        }
+                                    }
+                                }
+                                trae_machine::InstanceSource::Main => {
+                                    match trae_machine::main_data_dir() {
+                                        Ok(d) => {
+                                            if let Err(e) = trae_machine::focus_instance_window(
+                                                &d.to_string_lossy(),
+                                            ) {
+                                                eprintln!(
+                                                    "[tray] 聚焦账号 {} 主实例失败: {}",
+                                                    account_id, e
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[tray] 获取主实例目录失败: {}", e)
+                                        }
+                                    }
+                                }
+                                trae_machine::InstanceSource::None => {
+                                    // 后台启动,避免阻塞菜单事件回调
+                                    let app_handle = app.clone();
+                                    std::thread::spawn(move || {
+                                        if let Err(e) =
+                                            commands::launch_account_by_id(&app_handle, &account_id)
+                                        {
+                                            eprintln!("[tray] 启动账号 {} 失败: {}", account_id, e);
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -205,8 +256,9 @@ pub fn run() {
             commands::get_trae_exe_path,
             commands::set_trae_exe_path,
             commands::scan_trae_exe_path,
-            commands::is_account_instance_running,
+            commands::get_account_instance_state,
             commands::focus_account_instance,
+            commands::open_new_login_instance,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

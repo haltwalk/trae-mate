@@ -18,7 +18,7 @@ use crate::trae_machine::{
 const DEFAULT_TOKEN_DAYS: i64 = 14;
 const DEFAULT_REFRESH_DAYS: i64 = 180;
 /// 多开实例的共享插件目录名(--extensions-dir,省磁盘)
-const SHARED_EXTENSIONS_DIR: &str = "TRAE SOLO CN_SharedExtensions";
+pub const SHARED_EXTENSIONS_DIR: &str = "TRAE SOLO CN_SharedExtensions";
 
 /// 为账号启动多开实例:加密写 storage.json + 启动独立 data-dir 的 TRAE。
 /// 返回 data_dir/machine_id(供回写 Account,下次复用同一目录与机器码)。
@@ -31,7 +31,7 @@ pub fn launch_multi(account: &Account, cred: &Credential, exe_path: &str) -> App
         cred.user_id.clone()
     };
     if user_id.is_empty() {
-        return Err(AppError::Launch("账号缺少 userId,无法创建多开实例".into()));
+        return Err(AppError::Launch("账号缺少 userId,无法创建实例".into()));
     }
 
     // 1. data-dir:优先复用 account 已绑定的,否则按 userId 生成
@@ -55,7 +55,7 @@ pub fn launch_multi(account: &Account, cred: &Credential, exe_path: &str) -> App
 
     let data_path = PathBuf::from(&data_dir);
     fs::create_dir_all(&data_path)
-        .map_err(|e| AppError::Launch(format!("创建多开数据目录失败: {e}")))?;
+        .map_err(|e| AppError::Launch(format!("创建实例数据目录失败: {e}")))?;
     fs::write(data_path.join("machineid"), &machine_id)
         .map_err(|e| AppError::Launch(format!("写入机器码失败: {e}")))?;
 

@@ -5,7 +5,10 @@
       <div class="account-info">
         <div class="avatar">{{ account.name.charAt(0).toUpperCase() }}</div>
         <div class="account-name-wrap">
-          <h3 class="account-name">{{ account.name }}</h3>
+          <h3 class="account-name">
+            {{ account.name }}
+            <span v-if="instanceState.isMainAccount" class="badge-main">主账号</span>
+          </h3>
           <span class="badge" :class="statusBadgeClass">
             {{ statusText }}
           </span>
@@ -50,20 +53,20 @@
         <span>{{ checkingIn ? '签到中' : '立即签到' }}</span>
       </button>
       <button
-        v-if="!instanceRunning"
+        v-if="instanceState.source === 'none'"
         class="btn btn-sm btn-outline"
         @click="handleLaunchMulti"
         :disabled="launching"
-        :title="account.dataDir ? '启动该账号的多开实例' : '首次多开:创建独立实例并启动'"
+        :title="account.dataDir ? '启动该账号的独立实例' : '首次启动:创建独立实例并启动'"
       >
         <span v-if="launching" class="spinner"></span>
-        <span>{{ launching ? '程序正在启动,请稍后' : '多开' }}</span>
+        <span>{{ launching ? '程序正在启动,请稍后' : '启动' }}</span>
       </button>
       <button
         v-else
         class="btn btn-sm btn-outline"
         @click="handleFocus"
-        title="该账号实例已运行,点击聚焦其窗口"
+        :title="instanceState.source === 'main' ? '该账号在主实例运行,点击聚焦主实例窗口' : '该账号工具实例已运行,点击聚焦其窗口'"
       >
         <span>聚焦</span>
       </button>
@@ -86,7 +89,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
-import { useAppStore, type Account } from '../stores/app'
+import { useAppStore, type Account, type InstanceState } from '../stores/app'
 
 const props = defineProps<{
   account: Account
@@ -97,15 +100,15 @@ const store = useAppStore()
 
 const checkingIn = ref(false)
 const launching = ref(false)
-const instanceRunning = ref(false)
+const instanceState = ref<InstanceState>({ running: false, source: 'none', isMainAccount: false })
 
 onMounted(async () => {
-  instanceRunning.value = await store.isInstanceRunning(props.account.id)
+  instanceState.value = await store.getInstanceState(props.account.id)
 })
 
-// 监听全局刷新信号(顶部"刷新"按钮触发),重新查询本账号多开实例运行状态
+// 监听全局刷新信号(顶部"刷新"按钮触发),重新查询本账号实例运行状态(含主/工具来源)
 watch(() => store.instanceRefreshTick, async () => {
-  instanceRunning.value = await store.isInstanceRunning(props.account.id)
+  instanceState.value = await store.getInstanceState(props.account.id)
 })
 const editing = ref(false)
 const draftName = ref(props.account.name)
@@ -166,10 +169,12 @@ async function handleLaunchMulti() {
   launching.value = true
   try {
     await store.launchMulti(props.account.id)
-    instanceRunning.value = true
-    emit('notify', '多开实例已启动', 'success')
+    instanceState.value = { running: true, source: 'tool', isMainAccount: instanceState.value.isMainAccount }
+    emit('notify', '实例已启动', 'success')
   } catch (e: any) {
-    emit('notify', '多开启动失败: ' + (e?.message || e), 'error')
+    emit('notify', '启动失败: ' + (e?.message || e), 'error')
+    // 失败可能因状态过时(如该账号已在主实例运行),重新查询修正显示
+    instanceState.value = await store.getInstanceState(props.account.id)
   } finally {
     launching.value = false
   }
@@ -276,6 +281,19 @@ function formatDateTime(timestamp: number): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.badge-main {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 6px;
+  vertical-align: middle;
+  box-shadow: var(--accent-glow);
 }
 
 .badge {

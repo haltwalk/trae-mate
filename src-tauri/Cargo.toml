@@ -1,6 +1,6 @@
 [package]
 name = "trae-mate"
-version = "1.0.0"
+version = "1.1.0"
 description = "Trae Work 签到与多开账号管理 - Tauri2 版"
 authors = ["traemate"]
 edition = "2021"
@@ -33,6 +33,7 @@ chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

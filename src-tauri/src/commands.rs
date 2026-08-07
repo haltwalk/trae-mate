@@ -1,6 +1,8 @@
 // Tauri 命令实现。
 
-use tauri::{AppHandle, Manager, State};
+use std::path::PathBuf;
+
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::checkin;
 use crate::credentials;
@@ -136,9 +138,17 @@ pub fn clear_logs(state: State<'_, AppState>) -> AppResult<bool> {
 }
 
 #[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> AppSettings {
-    let data = state.data.lock().unwrap();
-    data.get_settings()
+pub fn get_settings(state: State<'_, AppState>, app: AppHandle) -> AppSettings {
+    let mut s = {
+        let data = state.data.lock().unwrap();
+        data.get_settings()
+    };
+    // 用插件真实状态覆盖(反映系统设置/任务管理器等外部修改)
+    use tauri_plugin_autostart::ManagerExt;
+    if let Ok(enabled) = app.autolaunch().is_enabled() {
+        s.launch_at_login = enabled;
+    }
+    s
 }
 
 #[tauri::command]
@@ -147,10 +157,22 @@ pub fn save_settings(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> AppResult<AppSettings> {
+    let has_launch = settings.launch_at_login.is_some();
     let mut data = state.data.lock().unwrap();
     let s = data.save_settings(settings);
     data.save(&state.path)?;
     drop(data);
+    // 同步开机自启插件状态(仅在本次提交了该字段时)
+    if has_launch {
+        use tauri_plugin_autostart::ManagerExt;
+        let mgr = app.autolaunch();
+        let currently = mgr.is_enabled().unwrap_or(false);
+        if s.launch_at_login && !currently {
+            let _ = mgr.enable();
+        } else if !s.launch_at_login && currently {
+            let _ = mgr.disable();
+        }
+    }
     // 设置变更后重启定时任务
     scheduler::start_scheduler(app);
     Ok(s)
@@ -181,42 +203,79 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 多开启动:用账号凭据加密写入独立 data-dir,启动免登录的 TRAE 实例
-#[tauri::command]
-pub fn launch_account_multi(
-    id: String,
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> AppResult<LaunchResult> {
+/// 启动账号独立实例(前端命令与托盘点击共用核心逻辑):
+/// 解密凭据 -> 解析 exe -> 启动 -> 回写 data_dir/machine_id -> 刷新托盘菜单
+pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<LaunchResult> {
+    let state = app.state::<AppState>();
     // 1. 取账号
     let account = {
         let data = state.data.lock().unwrap();
-        data.get_accounts().iter().find(|a| a.id == id).cloned()
+        data.get_accounts()
+            .iter()
+            .find(|a| a.id == account_id)
+            .cloned()
     }
-    .ok_or_else(|| AppError::NotFound(id.clone()))?;
+    .ok_or_else(|| AppError::NotFound(account_id.into()))?;
 
-    // 2. 解密凭据
-    let encrypted = account
-        .encrypted_credential
-        .as_ref()
-        .ok_or_else(|| AppError::Launch("该账号尚未导入 TRAE 桌面凭证,无法多开".into()))?;
-    let cred = credentials::decrypt_credential(encrypted)?;
+    // 防护:该账号已在主实例运行则拒绝启动(避免同账号双实例挤掉登录态、丢账号数据)
+    let main = trae_machine::probe_main_instance();
+    if matches!(
+        trae_machine::account_state(&account, &main),
+        trae_machine::InstanceSource::Main
+    ) {
+        return Err(AppError::Launch(
+            "该账号已在主实例运行,请聚焦主实例而非重复启动".into(),
+        ));
+    }
 
-    // 3. 解析 exe 路径(已保存或自动扫描)
+    // 2. 解析 exe 路径(已保存或自动扫描)
     let config_dir = app
         .path()
         .app_config_dir()
         .map_err(|e| AppError::Launch(format!("获取配置目录失败: {e}")))?;
     let exe_path = trae_machine::resolve_trae_path(&config_dir)?;
 
-    // 4. 启动多开(文件 I/O + 进程启动)
+    // 3. 主实例账号(主目录当前登录账号)用主目录启动,复用主实例登录态;否则独立目录多开。
+    //    主目录 userId 取自主目录 storage.json(主实例关闭后仍残留最后登录账号),实现"固定绑定主目录"。
+    let is_main_account = main.1.as_deref()
+        == account
+            .desktop_user_id
+            .as_deref()
+            .filter(|s| !s.is_empty());
+    if is_main_account {
+        let appdata = std::env::var("APPDATA")
+            .map_err(|_| AppError::Launch("无法获取 APPDATA 环境变量".into()))?;
+        let main_dir = PathBuf::from(&appdata).join(trae_machine::DATA_DIR_NAME);
+        let shared_ext = PathBuf::from(&appdata)
+            .join(trae_instance::SHARED_EXTENSIONS_DIR)
+            .to_string_lossy()
+            .to_string();
+        trae_machine::open_product_with_data_dir(
+            &exe_path,
+            &main_dir.to_string_lossy(),
+            Some(&shared_ext),
+        )?;
+        let _ = crate::rebuild_tray_menu(app);
+        return Ok(LaunchResult {
+            data_dir: main_dir.to_string_lossy().to_string(),
+            machine_id: String::new(),
+            launched: true,
+        });
+    }
+
+    // 4. 独立目录多开:解密凭据 -> launch_multi(写凭据到 TRAE SOLO CN_{userId})
+    let encrypted = account
+        .encrypted_credential
+        .as_ref()
+        .ok_or_else(|| AppError::Launch("该账号尚未导入 TRAE 桌面凭证,无法启动".into()))?;
+    let cred = credentials::decrypt_credential(encrypted)?;
     let result = trae_instance::launch_multi(&account, &cred, &exe_path)?;
 
-    // 5. 回写 data_dir/machine_id(首次多开时绑定,后续复用同一目录与机器码)
+    // 5. 回写 data_dir/machine_id(首次启动时绑定,后续复用同一目录与机器码)
     {
         let mut data = state.data.lock().unwrap();
         data.update_account(
-            &id,
+            account_id,
             serde_json::json!({
                 "dataDir": result.data_dir,
                 "machineId": result.machine_id,
@@ -225,10 +284,16 @@ pub fn launch_account_multi(
         let _ = data.save(&state.path);
     }
 
-    // 6. 刷新托盘菜单:新实例已运行,加入快捷聚焦列表
-    let _ = crate::rebuild_tray_menu(&app);
+    // 6. 刷新托盘菜单:新实例已运行,状态前缀更新
+    let _ = crate::rebuild_tray_menu(app);
 
     Ok(result)
+}
+
+/// 启动账号独立实例(前端命令入口)
+#[tauri::command]
+pub fn launch_account_multi(id: String, app: AppHandle) -> AppResult<LaunchResult> {
+    launch_account_by_id(&app, &id)
 }
 
 /// 获取已保存的 TRAE exe 路径(未设置返回 None)
@@ -263,34 +328,225 @@ pub fn scan_trae_exe_path(app: AppHandle) -> AppResult<String> {
     Ok(scanned)
 }
 
-/// 查询账号多开实例是否在运行
+/// 账号实例运行状态(返回前端)
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceState {
+    pub running: bool,
+    pub source: trae_machine::InstanceSource,
+    pub is_main_account: bool,
+}
+
+/// 查询账号实例运行状态:未运行 / 主实例(用户手动启动的 TRAE)/ 工具实例(本应用启动的独立 data-dir)
 #[tauri::command]
-pub fn is_account_instance_running(id: String, state: State<'_, AppState>) -> AppResult<bool> {
-    let data_dir = {
+pub fn get_account_instance_state(
+    id: String,
+    state: State<'_, AppState>,
+) -> AppResult<InstanceState> {
+    let account = {
         let data = state.data.lock().unwrap();
         data.get_accounts()
             .iter()
             .find(|a| a.id == id)
-            .and_then(|a| a.data_dir.clone())
-    };
-    match data_dir {
-        Some(d) if !d.is_empty() => Ok(trae_machine::is_instance_running(&d).0),
-        _ => Ok(false),
+            .cloned()
+    }
+    .ok_or_else(|| AppError::NotFound(id.clone()))?;
+    let main = trae_machine::probe_main_instance();
+    let source = trae_machine::account_state(&account, &main);
+    let is_main_account = main.1.as_deref()
+        == account
+            .desktop_user_id
+            .as_deref()
+            .filter(|s| !s.is_empty());
+    Ok(InstanceState {
+        running: !matches!(source, trae_machine::InstanceSource::None),
+        source,
+        is_main_account,
+    })
+}
+
+/// 聚焦账号实例窗口:工具实例运行聚焦其 data-dir 窗口,主实例运行聚焦主目录窗口,未运行则报错。
+#[tauri::command]
+pub fn focus_account_instance(id: String, state: State<'_, AppState>) -> AppResult<()> {
+    let account = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts()
+            .iter()
+            .find(|a| a.id == id)
+            .cloned()
+    }
+    .ok_or_else(|| AppError::NotFound(id.clone()))?;
+    let main = trae_machine::probe_main_instance();
+    match trae_machine::account_state(&account, &main) {
+        trae_machine::InstanceSource::Tool => {
+            let d = account
+                .data_dir
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| AppError::Launch("该账号无工具实例数据目录".into()))?;
+            trae_machine::focus_instance_window(d)
+        }
+        trae_machine::InstanceSource::Main => {
+            let main_dir = trae_machine::main_data_dir()?;
+            trae_machine::focus_instance_window(&main_dir.to_string_lossy())
+        }
+        trae_machine::InstanceSource::None => {
+            Err(AppError::Launch("该账号尚未启动,无实例可聚焦".into()))
+        }
     }
 }
 
-/// 聚焦账号多开实例的窗口(提到前台)
+/// 打开新的空白 TRAE 实例供用户登录,后台轮询登录完成后自动导入账号:
+/// 检测登录 -> 读凭据 -> 杀实例 -> 改名临时目录为标准 TRAE SOLO CN_{userId} -> upsert 账号绑定 -> emit 事件。
 #[tauri::command]
-pub fn focus_account_instance(id: String, state: State<'_, AppState>) -> AppResult<()> {
-    let data_dir = {
-        let data = state.data.lock().unwrap();
-        data.get_accounts()
-            .iter()
-            .find(|a| a.id == id)
-            .and_then(|a| a.data_dir.clone())
-    };
-    match data_dir {
-        Some(d) if !d.is_empty() => trae_machine::focus_instance_window(&d),
-        _ => Err(AppError::Launch("该账号尚未多开,无实例可聚焦".into())),
+pub fn open_new_login_instance(app: AppHandle) -> AppResult<()> {
+    let appdata = std::env::var("APPDATA")
+        .map_err(|_| AppError::Launch("无法获取 APPDATA 环境变量".into()))?;
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| AppError::Launch(format!("获取配置目录失败: {e}")))?;
+    let exe_path = trae_machine::resolve_trae_path(&config_dir)?;
+
+    // 临时 data-dir(带 uuid 后缀,避免与标准目录或多次操作冲突)
+    let temp_dir = PathBuf::from(&appdata)
+        .join(format!(
+            "{} login {}",
+            trae_machine::DATA_DIR_NAME,
+            uuid::Uuid::new_v4()
+        ))
+        .to_string_lossy()
+        .to_string();
+    let shared_ext = PathBuf::from(&appdata)
+        .join(trae_instance::SHARED_EXTENSIONS_DIR)
+        .to_string_lossy()
+        .to_string();
+
+    // 启动空白实例(不写凭据,用户自行登录)
+    trae_machine::open_product_with_data_dir(&exe_path, &temp_dir, Some(&shared_ext))?;
+
+    // 后台轮询登录 + 导入,完成后 emit 事件
+    let app_handle = app.clone();
+    let appdata_owned = appdata;
+    let temp_dir_owned = temp_dir;
+    std::thread::spawn(move || {
+        let result = wait_login_and_import(&app_handle, &appdata_owned, &temp_dir_owned);
+        let _ = app_handle.emit("login-imported", result);
+    });
+    Ok(())
+}
+
+/// 轮询临时实例登录态,登录后导入账号并改名目录。返回事件 payload。
+fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serde_json::Value {
+    let storage_path = PathBuf::from(temp_dir)
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+
+    // 轮询 iCubeAuthInfo 出现(2s 一次,最多 10 分钟)
+    let mut logged_in = false;
+    for _ in 0..300 {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if storage_path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&storage_path) {
+                if let Ok(storage) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if storage
+                        .get("iCubeAuthInfo://icube.cloudide")
+                        .and_then(|v| v.as_str())
+                        .is_some()
+                    {
+                        logged_in = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
+    if !logged_in {
+        return serde_json::json!({
+            "success": false,
+            "error": "登录超时(10 分钟未检测到登录),临时目录已保留供手动处理"
+        });
+    }
+
+    // 读凭据
+    let cred = match trae_auth::read_credentials_from_data_dir(&PathBuf::from(temp_dir)) {
+        Ok(c) => c,
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "error": format!("读取登录凭据失败: {e}")
+            })
+        }
+    };
+    let user_id = cred.user_id.clone();
+    if user_id.is_empty() {
+        return serde_json::json!({
+            "success": false,
+            "error": "登录凭据缺少 userId"
+        });
+    }
+
+    // 杀实例并等退出(目录占用解除后才能改名)
+    let _ = trae_machine::kill_instance(temp_dir);
+    for _ in 0..20 {
+        if !trae_machine::is_instance_running(temp_dir).0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // 改名为标准目录 TRAE SOLO CN_{userId}(目标已存在则先删除旧的)
+    let target_dir =
+        PathBuf::from(appdata).join(format!("{}_{}", trae_machine::DATA_DIR_NAME, user_id));
+    if target_dir.exists() {
+        let _ = std::fs::remove_dir_all(&target_dir);
+    }
+    if let Err(e) = std::fs::rename(temp_dir, &target_dir) {
+        return serde_json::json!({
+            "success": false,
+            "error": format!("改名为标准目录失败: {e}")
+        });
+    }
+
+    // upsert 账号(绑定标准目录 + 机器码 + 加密凭据)
+    let encrypted = match credentials::encrypt_credential(&cred) {
+        Ok(e) => e,
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "error": format!("加密凭据失败: {e}")
+            })
+        }
+    };
+    let now = now_ms();
+    let status = credential_status(cred.expires_at, now);
+    let account = Account {
+        id: generate_id(),
+        name: cred.account_name.clone(),
+        cookie: String::new(),
+        created_at: now,
+        last_checkin_at: None,
+        last_checkin_result: None,
+        last_checkin_message: None,
+        points: None,
+        enabled: true,
+        desktop_user_id: Some(user_id.clone()),
+        encrypted_credential: Some(encrypted),
+        credential_status: Some(status.to_string()),
+        data_dir: Some(target_dir.to_string_lossy().to_string()),
+        machine_id: Some(cred.machine_id.clone()),
+    };
+    {
+        let state = app.state::<AppState>();
+        let mut data = state.data.lock().unwrap();
+        data.upsert_desktop_account(account);
+        let _ = data.save(&state.path);
+    }
+    let _ = crate::rebuild_tray_menu(app);
+    serde_json::json!({
+        "success": true,
+        "name": cred.account_name,
+        "userId": user_id
+    })
 }

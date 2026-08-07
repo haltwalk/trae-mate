@@ -98,6 +98,7 @@ pub struct AppSettings {
     pub retry_delay: u32, // 秒
     pub notify_on_success: bool,
     pub notify_on_failed: bool,
+    pub launch_at_login: bool,
 }
 
 impl Default for AppSettings {
@@ -109,6 +110,7 @@ impl Default for AppSettings {
             retry_delay: 60,
             notify_on_success: true,
             notify_on_failed: true,
+            launch_at_login: false,
         }
     }
 }
@@ -129,6 +131,8 @@ pub struct PartialAppSettings {
     pub notify_on_success: Option<bool>,
     #[serde(default)]
     pub notify_on_failed: Option<bool>,
+    #[serde(default)]
+    pub launch_at_login: Option<bool>,
 }
 
 impl AppSettings {
@@ -151,6 +155,9 @@ impl AppSettings {
         }
         if let Some(v) = p.notify_on_failed {
             self.notify_on_failed = v;
+        }
+        if let Some(v) = p.launch_at_login {
+            self.launch_at_login = v;
         }
     }
 }

@@ -87,7 +87,7 @@
             @click="handleRefresh"
             :disabled="refreshing"
             v-if="activeTab === 'accounts'"
-            title="刷新账号与多开实例状态"
+            title="刷新账号与实例状态"
           >
             <Icon name="arrow-path" :size="16" :class="{ spinning: refreshing }" />
             <span>刷新</span>
@@ -112,6 +112,10 @@
         </div>
       </header>
 
+      <div v-if="store.waitingLogin" class="login-waiting-banner">
+        正在等待新实例登录,登录后将自动导入账号…
+      </div>
+
       <!-- 内容区域 -->
       <div class="content-area">
         <AccountList v-if="activeTab === 'accounts'" @add-account="showAddModal = true" @notify="showToast" />
@@ -125,6 +129,7 @@
     <AddAccountModal
       v-model:visible="showAddModal"
       @success="handleAddSuccess"
+      @notify="showToast"
     />
   </div>
 </template>
@@ -215,6 +220,17 @@ onMounted(() => {
   listen('tray-checkin', () => {
     handleCheckinAll()
   })
+  // 监听"打开新实例登录"导入结果(后端轮询登录完成后 emit)
+  listen('login-imported', (event) => {
+    const p = event.payload as { success: boolean; name?: string; error?: string }
+    store.waitingLogin = false
+    if (p.success) {
+      showToast(`账号「${p.name || ''}」已自动导入`, 'success')
+      store.fetchAccounts()
+    } else {
+      showToast(`导入失败: ${p.error || '未知错误'}`, 'error')
+    }
+  })
 })
 </script>
 
@@ -235,6 +251,15 @@ onMounted(() => {
   flex: 1;
   display: flex;
   min-height: 0;
+}
+
+.login-waiting-banner {
+  padding: 10px 24px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
 }
 
 /* 窗口操作栏 - 窗口控件左、主题切换右,两端对齐(独立于 logo 区,不共卡片) */

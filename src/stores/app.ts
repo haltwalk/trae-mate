@@ -46,6 +46,12 @@ export interface LaunchResult {
   launched: boolean
 }
 
+export interface InstanceState {
+  running: boolean
+  source: 'none' | 'main' | 'tool'
+  isMainAccount: boolean
+}
+
 export interface AppSettings {
   autoCheckin: boolean
   checkinTime: string
@@ -53,6 +59,7 @@ export interface AppSettings {
   retryDelay: number
   notifyOnSuccess: boolean
   notifyOnFailed: boolean
+  launchAtLogin: boolean
   // 以下字段为兼容旧 UI(已隐藏),desktop 模式下后端不再使用
   checkinMode?: 'webview' | 'api'
   apiConfig?: {
@@ -71,6 +78,7 @@ export const useAppStore = defineStore('app', () => {
   const loading = ref(false)
   const checkingIn = ref(false)
   const launching = ref(false) // 多开启动中
+  const waitingLogin = ref(false) // 等待新实例登录导入(打开新实例登录后置 true,login-imported 事件后置 false)
   const instanceRefreshTick = ref(0) // 多开状态刷新信号:自增触发各卡片重查
   const nextRunTime = ref<string | null>(null)
 
@@ -217,13 +225,25 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
-  // 查询账号多开实例是否在运行
-  async function isInstanceRunning(id: string): Promise<boolean> {
+  // 打开新的空白 TRAE 实例供用户登录(登录后后端自动导入账号并 emit login-imported 事件)
+  // waitingLogin 标记等待状态,供界面显示持续提示;login-imported 事件回调中复位
+  async function openNewLoginInstance() {
+    waitingLogin.value = true
     try {
-      return await invoke<boolean>('is_account_instance_running', { id })
+      await invoke('open_new_login_instance')
     } catch (e) {
-      console.error('查询实例运行状态失败:', e)
-      return false
+      waitingLogin.value = false
+      throw e
+    }
+  }
+
+  // 查询账号实例运行状态(含来源:主实例/工具实例/未运行)
+  async function getInstanceState(id: string): Promise<InstanceState> {
+    try {
+      return await invoke<InstanceState>('get_account_instance_state', { id })
+    } catch (e) {
+      console.error('查询实例状态失败:', e)
+      return { running: false, source: 'none', isMainAccount: false }
     }
   }
 
@@ -278,6 +298,7 @@ export const useAppStore = defineStore('app', () => {
     loading,
     checkingIn,
     launching,
+    waitingLogin,
     instanceRefreshTick,
     nextRunTime,
     // 计算属性
@@ -297,7 +318,8 @@ export const useAppStore = defineStore('app', () => {
     saveSettings,
     fetchNextRunTime,
     launchMulti,
-    isInstanceRunning,
+    openNewLoginInstance,
+    getInstanceState,
     focusInstance,
     refreshInstances,
     getTraeExePath,

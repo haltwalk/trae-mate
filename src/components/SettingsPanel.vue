@@ -71,6 +71,23 @@
     </div>
 
     <div class="settings-section card" v-if="store.settings">
+      <h3 class="section-title">开机自启动</h3>
+      <p class="section-desc">开机后自动启动并静默到系统托盘,保证自动签到持续运行</p>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-label">开机自启动</span>
+          <span class="setting-desc">开机时自动启动,隐藏到托盘不弹出窗口</span>
+        </div>
+        <div
+          class="switch"
+          :class="{ active: store.settings.launchAtLogin }"
+          @click="toggleLaunchAtLogin"
+        ></div>
+      </div>
+    </div>
+
+    <div class="settings-section card" v-if="store.settings">
       <h3 class="section-title">通知设置</h3>
       <p class="section-desc">控制签到结果的桌面通知</p>
 
@@ -220,13 +237,13 @@
     </div>
 
     <div class="settings-section card">
-      <h3 class="section-title">多开实例 · TRAE 客户端路径</h3>
-      <p class="section-desc">多开启动需要指定 TRAE Work CN 客户端(TRAE SOLO CN.exe),用于为每个账号启动独立实例</p>
+      <h3 class="section-title">实例启动 · TRAE 客户端路径</h3>
+      <p class="section-desc">启动独立实例需要指定 TRAE Work CN 客户端(TRAE SOLO CN.exe),为每个账号启动独立实例</p>
 
       <div class="setting-item">
         <div class="setting-info">
           <span class="setting-label">客户端路径</span>
-          <span class="setting-desc trae-path">{{ traeExePath || '未设置,多开时将自动扫描' }}</span>
+          <span class="setting-desc trae-path">{{ traeExePath || '未设置,启动时将自动扫描' }}</span>
         </div>
       </div>
 
@@ -244,7 +261,7 @@
       <div class="tip-box">
         <div class="tip-icon"><Icon name="light-bulb" :size="20" /></div>
         <div class="tip-content">
-          <p class="tip-title">多开说明</p>
+          <p class="tip-title">启动说明</p>
           <p class="tip-desc">每个账号启动一个独立 TRAE 实例(独立 data-dir),用账号凭证免登录、互不干扰;插件目录共享以节省磁盘。每个实例约占 3-8 GB。</p>
         </div>
       </div>
@@ -258,7 +275,7 @@
       <div class="about-info">
         <div class="about-row">
           <span class="about-label">版本</span>
-          <span class="about-value">v1.0.0</span>
+          <span class="about-value">v1.1.0</span>
         </div>
         <div class="about-row">
           <span class="about-label">技术栈</span>
@@ -381,6 +398,11 @@ async function toggleNotifySuccess() {
 async function toggleNotifyFailed() {
   if (!store.settings) return
   await store.saveSettings({ notifyOnFailed: !store.settings.notifyOnFailed })
+}
+
+async function toggleLaunchAtLogin() {
+  if (!store.settings) return
+  await store.saveSettings({ launchAtLogin: !store.settings.launchAtLogin })
 }
 
 async function setCheckinMode(mode: 'webview' | 'api') {

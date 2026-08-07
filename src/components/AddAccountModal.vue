@@ -35,6 +35,9 @@
 
       <div class="modal-footer">
         <button class="btn btn-secondary" @click="handleClose">取消</button>
+        <button class="btn btn-outline" @click="openNewLoginInstance" :disabled="submitting">
+          打开新实例登录
+        </button>
         <button class="btn btn-primary" @click="importDesktopAccount" :disabled="submitting">
           <span v-if="submitting" class="spinner"></span>
           <span>{{ submitting ? '导入中...' : '导入当前 TRAE 桌面账号' }}</span>
@@ -53,7 +56,7 @@ const props = defineProps<{
   visible: boolean
 }>()
 
-const emit = defineEmits(['update:visible', 'success'])
+const emit = defineEmits(['update:visible', 'success', 'notify'])
 
 const store = useAppStore()
 
@@ -83,6 +86,15 @@ async function importDesktopAccount() {
     alert('导入失败: ' + (e.message || e))
   } finally {
     submitting.value = false
+  }
+}
+
+async function openNewLoginInstance() {
+  emit('update:visible', false)
+  try {
+    await store.openNewLoginInstance()
+  } catch (e: any) {
+    emit('notify', '打开实例失败: ' + (e?.message || e), 'error')
   }
 }
 </script>

@@ -10,7 +10,7 @@
 //    明文 = digest(64) + payload(JSON);校验 digest == SHA512(payload)
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use base64::{engine::general_purpose, Engine as _};
@@ -158,12 +158,17 @@ pub fn encrypt_trae_auth_info(plaintext: &str) -> AppResult<String> {
     Ok(general_purpose::STANDARD.encode(&output))
 }
 
-/// 读取并解密当前 TRAE 桌面客户端凭据
+/// 读取并解密当前 TRAE 桌面客户端凭据(主目录 %APPDATA%\TRAE SOLO CN)
 pub fn get_trae_desktop_credentials() -> AppResult<Credential> {
     let appdata = env::var("APPDATA")
         .map_err(|_| AppError::Credential("Windows APPDATA directory is unavailable".into()))?;
-    let storage_path = PathBuf::from(&appdata)
-        .join("TRAE SOLO CN")
+    let data_dir = PathBuf::from(&appdata).join("TRAE SOLO CN");
+    read_credentials_from_data_dir(&data_dir)
+}
+
+/// 读取并解密指定 data-dir 的凭据(通用:主目录或独立实例目录均可)
+pub fn read_credentials_from_data_dir(data_dir: &Path) -> AppResult<Credential> {
+    let storage_path = data_dir
         .join("User")
         .join("globalStorage")
         .join("storage.json");
@@ -282,6 +287,32 @@ pub fn get_trae_desktop_credentials() -> AppResult<Credential> {
         avatar_url,
         region,
     })
+}
+
+/// 读取主目录实例当前登录的 userId(读 %APPDATA%\TRAE SOLO CN\...\storage.json 解密 iCubeAuthInfo)。
+/// 仅用于判断主实例登录账号:失败返回 None(主实例未登录/异常时不阻断状态判定)。
+pub fn read_main_instance_user_id() -> Option<String> {
+    let appdata = env::var("APPDATA").ok()?;
+    let storage_path = PathBuf::from(&appdata)
+        .join("TRAE SOLO CN")
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let raw = std::fs::read_to_string(&storage_path).ok()?;
+    let storage: Value = serde_json::from_str(&raw).ok()?;
+    let encrypted = storage
+        .get("iCubeAuthInfo://icube.cloudide")
+        .and_then(|v| v.as_str())?;
+    let auth_info = decrypt_trae_auth_info(encrypted).ok()?;
+    let uid = auth_info
+        .get("userId")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    if uid.is_empty() {
+        None
+    } else {
+        Some(uid)
+    }
 }
 
 /// 解析时间字符串为毫秒时间戳(对应原 Date.parse)

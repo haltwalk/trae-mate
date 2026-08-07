@@ -9,6 +9,8 @@ use std::process::Command;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::models::Account;
+use crate::trae_auth;
 
 /// TRAE SOLO CN 进程名
 pub const PROCESS_NAME: &str = "TRAE SOLO CN.exe";
@@ -290,6 +292,54 @@ pub fn is_instance_running(data_dir: &str) -> (bool, Option<u32>) {
     }
 }
 
+// ===== 主实例(默认 data-dir)检测 =====
+
+/// 主实例 data-dir(%APPDATA%\TRAE SOLO CN,即用户手动启动 TRAE 用的默认目录)
+pub fn main_data_dir() -> AppResult<PathBuf> {
+    let appdata = std::env::var("APPDATA")
+        .map_err(|_| AppError::Launch("无法获取 APPDATA 环境变量".into()))?;
+    Ok(PathBuf::from(&appdata).join(DATA_DIR_NAME))
+}
+
+/// 账号实例运行来源
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InstanceSource {
+    None,
+    Main,
+    Tool,
+}
+
+/// 探测主实例状态:(是否运行, 登录 userId)。仅在运行时读 storage.json,避免读到残留登录态。
+pub fn probe_main_instance() -> (bool, Option<String>) {
+    let running = match main_data_dir() {
+        Ok(d) => is_instance_running(&d.to_string_lossy()).0,
+        Err(_) => false,
+    };
+    // userId 不管运行都读(主实例关闭后 storage.json 仍残留最后登录账号),供 is_main_account 判断
+    let user_id = trae_auth::read_main_instance_user_id();
+    (running, user_id)
+}
+
+/// 判定账号运行状态:工具实例(账号 data-dir 运行)优先,其次主实例(登录 userId 匹配 desktop_user_id)。
+pub fn account_state(account: &Account, main: &(bool, Option<String>)) -> InstanceSource {
+    if account
+        .data_dir
+        .as_deref()
+        .map_or(false, |d| !d.is_empty() && is_instance_running(d).0)
+    {
+        return InstanceSource::Tool;
+    }
+    if main.0 {
+        if let (Some(main_uid), Some(desktop_uid)) = (&main.1, &account.desktop_user_id) {
+            if !desktop_uid.is_empty() && desktop_uid == main_uid {
+                return InstanceSource::Main;
+            }
+        }
+    }
+    InstanceSource::None
+}
+
 // ===== 聚焦实例窗口 =====
 
 /// 聚焦指定 data-dir 实例的窗口:读 code.lock 拿 PID,枚举顶层窗口找该进程的可见窗口,提到前台。
@@ -350,6 +400,30 @@ pub fn focus_instance_window(data_dir: &str) -> AppResult<()> {
 #[cfg(not(target_os = "windows"))]
 pub fn focus_instance_window(_data_dir: &str) -> AppResult<()> {
     Err(AppError::Launch("聚焦窗口仅支持 Windows".into()))
+}
+
+/// 关闭指定 data-dir 的实例(读 code.lock PID,taskkill /F /T 杀进程树)
+#[cfg(target_os = "windows")]
+pub fn kill_instance(data_dir: &str) -> AppResult<()> {
+    let lock_path = Path::new(data_dir).join("code.lock");
+    if !lock_path.exists() {
+        return Ok(()); // 无锁,认为未运行
+    }
+    let pid_str = fs::read_to_string(&lock_path)
+        .map_err(|e| AppError::Launch(format!("读取 code.lock 失败: {e}")))?;
+    let pid: u32 = pid_str
+        .trim()
+        .parse()
+        .map_err(|_| AppError::Launch("code.lock 的 PID 无效".into()))?;
+    let _ = hide_window(Command::new("taskkill"))
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .output();
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn kill_instance(_data_dir: &str) -> AppResult<()> {
+    Err(AppError::Launch("关闭实例仅支持 Windows".into()))
 }
 
 // ===== 窗口标题 =====
