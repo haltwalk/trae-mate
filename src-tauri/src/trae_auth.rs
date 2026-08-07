@@ -100,6 +100,64 @@ pub fn decrypt_trae_auth_info(encoded: &str) -> AppResult<Value> {
     Ok(json)
 }
 
+/// 加密 TRAE 桌面客户端的加密信封(与 decrypt_trae_auth_info 互为逆运算)。
+/// 用于多开实例:把账号登录信息加密写入独立 data-dir 的 storage.json。
+/// 信封 = HEADER(6) + 随机 embedded_key(32) + AES-128-CBC( HMAC_SHA512(64) ‖ plaintext+PKCS7 ),Base64。
+pub fn encrypt_trae_auth_info(plaintext: &str) -> AppResult<String> {
+    use aes::cipher::{BlockEncryptMut, KeyIvInit};
+    use rand::RngCore;
+
+    // 1. 随机 32 字节 embedded_key(对应 decrypt 的 random_key)
+    let mut embedded_key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut embedded_key);
+
+    // 2. secret = LEFT_SECRET ⊕ RIGHT_SECRET(与 decrypt 一致)
+    let mut secret = [0u8; 64];
+    for i in 0..64 {
+        secret[i] = LEFT_SECRET[i] ^ RIGHT_SECRET[i];
+    }
+
+    // 3. 派生 AES-128 key/iv:SHA512( SHA512(embedded_key) ‖ secret )
+    let mut derived_input = Vec::with_capacity(128);
+    derived_input.extend_from_slice(&sha512(&embedded_key));
+    derived_input.extend_from_slice(&secret);
+    let derived = sha512(&derived_input);
+    let key: [u8; 16] = derived[0..16].try_into().unwrap();
+    let iv: [u8; 16] = derived[16..32].try_into().unwrap();
+
+    // 4. HMAC = SHA512(plaintext),前置拼接
+    let plaintext_bytes = plaintext.as_bytes();
+    let hmac = sha512(plaintext_bytes);
+    let mut data = Vec::with_capacity(64 + plaintext_bytes.len());
+    data.extend_from_slice(&hmac);
+    data.extend_from_slice(plaintext_bytes);
+
+    // 5. PKCS7 填充到 16 字节倍数
+    let pad_len = 16 - (data.len() % 16);
+    let pad_byte = pad_len as u8;
+    for _ in 0..pad_len {
+        data.push(pad_byte);
+    }
+
+    // 6. AES-128-CBC 加密(逐块,encrypt_block_b2b_mut 内部维护 CBC 链)
+    let mut ciphertext = vec![0u8; data.len()];
+    let mut encryptor = cbc::Encryptor::<aes::Aes128>::new(&key.into(), &iv.into());
+    for (chunk, out_chunk) in data.chunks(16).zip(ciphertext.chunks_mut(16)) {
+        let mut block = aes::Block::default();
+        block.copy_from_slice(chunk);
+        let mut out_block = aes::Block::default();
+        encryptor.encrypt_block_b2b_mut(&block, &mut out_block);
+        out_chunk.copy_from_slice(&out_block);
+    }
+
+    // 7. 拼装信封:HEADER(6) + embedded_key(32) + ciphertext,Base64
+    let mut output = Vec::with_capacity(6 + 32 + ciphertext.len());
+    output.extend_from_slice(&HEADER);
+    output.extend_from_slice(&embedded_key);
+    output.extend_from_slice(&ciphertext);
+    Ok(general_purpose::STANDARD.encode(&output))
+}
+
 /// 读取并解密当前 TRAE 桌面客户端凭据
 pub fn get_trae_desktop_credentials() -> AppResult<Credential> {
     let appdata = env::var("APPDATA")
@@ -184,6 +242,30 @@ pub fn get_trae_desktop_credentials() -> AppResult<Credential> {
         .unwrap_or("")
         .to_string();
 
+    // 多开写 storage.json 需要的账号资料(从 account 对象提取)
+    let account_obj = auth_info.get("account");
+    let email = account_obj
+        .and_then(|a| a.get("email"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let avatar_url = account_obj
+        .and_then(|a| a.get("avatar_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let region = auth_info
+        .get("userRegion")
+        .and_then(|r| r.get("region"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // 兜底:按 host 推断(中国版 api.trae.cn => CN,其余 => SG)
+            if host.contains("api.trae.cn") {
+                Some("CN".into())
+            } else {
+                Some("SG".into())
+            }
+        });
+
     Ok(Credential {
         token: token.to_string(),
         refresh_token,
@@ -196,6 +278,9 @@ pub fn get_trae_desktop_credentials() -> AppResult<Credential> {
         user_id,
         account_name,
         host,
+        email,
+        avatar_url,
+        region,
     })
 }
 
@@ -222,6 +307,32 @@ fn parse_time_ms(v: Option<&Value>) -> AppResult<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// encrypt -> decrypt 往返:加密结果必须能被现有解密链路还原(decrypt 会 JSON 解析 payload)
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let cases: Vec<String> = vec![
+            "{}".into(),
+            "{\"a\":1}".into(),
+            "{\"token\":\"abc\",\"userId\":\"u1\"}".into(),
+            "{\"msg\":\"hello 多开实例\"}".into(),
+            format!("{{\"data\":\"{}\"}}", "x".repeat(100)),
+        ];
+        for plain in &cases {
+            let encrypted = encrypt_trae_auth_info(plain).expect("加密失败");
+            let decrypted = decrypt_trae_auth_info(&encrypted).expect("解密失败");
+            let expected: Value = serde_json::from_str(plain).unwrap();
+            assert_eq!(decrypted, expected, "roundtrip 失败: {plain}");
+        }
+    }
+
+    /// 同明文每次加密应产生不同密文(embedded_key 随机)
+    #[test]
+    fn encrypt_produces_different_ciphertext() {
+        let a = encrypt_trae_auth_info("{}").unwrap();
+        let b = encrypt_trae_auth_info("{}").unwrap();
+        assert_ne!(a, b, "embedded_key 随机,同明文密文应不同");
+    }
 
     /// 用本机真实 storage.json 验证解密链路。不输出任何敏感值,
     /// 仅断言能解出非空 token/userId/host(说明算法正确)。

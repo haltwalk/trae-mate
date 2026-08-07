@@ -49,6 +49,24 @@
         <span v-if="checkingIn" class="spinner"></span>
         <span>{{ checkingIn ? '签到中' : '立即签到' }}</span>
       </button>
+      <button
+        v-if="!instanceRunning"
+        class="btn btn-sm btn-outline"
+        @click="handleLaunchMulti"
+        :disabled="launching"
+        :title="account.dataDir ? '启动该账号的多开实例' : '首次多开:创建独立实例并启动'"
+      >
+        <span v-if="launching" class="spinner"></span>
+        <span>{{ launching ? '程序正在启动,请稍后' : '多开' }}</span>
+      </button>
+      <button
+        v-else
+        class="btn btn-sm btn-outline"
+        @click="handleFocus"
+        title="该账号实例已运行,点击聚焦其窗口"
+      >
+        <span>聚焦</span>
+      </button>
       <button type="button" class="btn btn-sm btn-outline" @click.stop="startEdit">
         编辑
       </button>
@@ -67,16 +85,28 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
-import type { Account } from '../stores/app'
+import { ref, computed, onMounted, watch } from 'vue'
+import { useAppStore, type Account } from '../stores/app'
 
 const props = defineProps<{
   account: Account
 }>()
 
-const emit = defineEmits(['checkin', 'toggle', 'delete', 'edit'])
+const emit = defineEmits(['checkin', 'toggle', 'delete', 'edit', 'notify'])
+const store = useAppStore()
 
 const checkingIn = ref(false)
+const launching = ref(false)
+const instanceRunning = ref(false)
+
+onMounted(async () => {
+  instanceRunning.value = await store.isInstanceRunning(props.account.id)
+})
+
+// 监听全局刷新信号(顶部"刷新"按钮触发),重新查询本账号多开实例运行状态
+watch(() => store.instanceRefreshTick, async () => {
+  instanceRunning.value = await store.isInstanceRunning(props.account.id)
+})
 const editing = ref(false)
 const draftName = ref(props.account.name)
 
@@ -129,6 +159,27 @@ async function handleCheckin() {
     setTimeout(() => {
       checkingIn.value = false
     }, 1000)
+  }
+}
+
+async function handleLaunchMulti() {
+  launching.value = true
+  try {
+    await store.launchMulti(props.account.id)
+    instanceRunning.value = true
+    emit('notify', '多开实例已启动', 'success')
+  } catch (e: any) {
+    emit('notify', '多开启动失败: ' + (e?.message || e), 'error')
+  } finally {
+    launching.value = false
+  }
+}
+
+async function handleFocus() {
+  try {
+    await store.focusInstance(props.account.id)
+  } catch (e: any) {
+    emit('notify', '聚焦失败: ' + (e?.message || e), 'error')
   }
 }
 

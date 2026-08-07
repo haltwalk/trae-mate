@@ -220,6 +220,37 @@
     </div>
 
     <div class="settings-section card">
+      <h3 class="section-title">多开实例 · TRAE 客户端路径</h3>
+      <p class="section-desc">多开启动需要指定 TRAE Work CN 客户端(TRAE SOLO CN.exe),用于为每个账号启动独立实例</p>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-label">客户端路径</span>
+          <span class="setting-desc trae-path">{{ traeExePath || '未设置,多开时将自动扫描' }}</span>
+        </div>
+      </div>
+
+      <div class="trae-path-actions">
+        <button class="btn btn-sm btn-outline" @click="scanTraePath" :disabled="pathBusy !== ''">
+          <span v-if="pathBusy === 'scan'" class="spinner"></span>
+          <span>{{ pathBusy === 'scan' ? '扫描中' : '自动扫描' }}</span>
+        </button>
+        <button class="btn btn-sm btn-primary" @click="chooseTraePath" :disabled="pathBusy !== ''">
+          <span v-if="pathBusy === 'choose'" class="spinner"></span>
+          <span>{{ pathBusy === 'choose' ? '选择中' : '选择文件' }}</span>
+        </button>
+      </div>
+
+      <div class="tip-box">
+        <div class="tip-icon"><Icon name="light-bulb" :size="20" /></div>
+        <div class="tip-content">
+          <p class="tip-title">多开说明</p>
+          <p class="tip-desc">每个账号启动一个独立 TRAE 实例(独立 data-dir),用账号凭证免登录、互不干扰;插件目录共享以节省磁盘。每个实例约占 3-8 GB。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section card">
       <h3 class="section-title">关于</h3>
       <p class="section-desc">TraeCheck · TRAE Work 桌面账号签到助手</p>
       <p class="section-desc">支持多账号凭证管理、自动签到、签到后总积分刷新和账号显示名称编辑。凭证仅保存在本机，用于调用 TRAE 桌面接口。</p>
@@ -255,11 +286,53 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, onMounted } from 'vue'
+import { open } from '@tauri-apps/plugin-dialog'
 import { useAppStore } from '../stores/app'
 import Icon from './Icon.vue'
 
 const store = useAppStore()
+const emit = defineEmits(['notify'])
+
+// 多开实例 TRAE 客户端路径
+const traeExePath = ref<string | null>(null)
+const pathBusy = ref<'' | 'scan' | 'choose'>('')
+
+onMounted(async () => {
+  traeExePath.value = await store.getTraeExePath()
+})
+
+async function scanTraePath() {
+  pathBusy.value = 'scan'
+  try {
+    const path = await store.scanTraeExePath()
+    traeExePath.value = path
+    emit('notify', '已扫描到 TRAE 路径', 'success')
+  } catch (e: any) {
+    emit('notify', '扫描失败: ' + (e?.message || e), 'error')
+  } finally {
+    pathBusy.value = ''
+  }
+}
+
+async function chooseTraePath() {
+  pathBusy.value = 'choose'
+  try {
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: 'TRAE SOLO CN', extensions: ['exe'] }]
+    })
+    if (typeof selected === 'string' && selected) {
+      await store.setTraeExePath(selected)
+      traeExePath.value = selected
+      emit('notify', '路径已保存', 'success')
+    }
+  } catch (e: any) {
+    emit('notify', '选择文件失败: ' + (e?.message || e), 'error')
+  } finally {
+    pathBusy.value = ''
+  }
+}
 
 const nextRunText = computed(() => {
   if (!store.settings?.autoCheckin) return '未启用'
@@ -671,5 +744,18 @@ function formatJson(obj?: Record<string, any>): string {
   font-size: 12px;
   color: var(--text-secondary);
   line-height: 1.6;
+}
+
+/* 多开路径操作按钮组 */
+.trae-path-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.trae-path {
+  word-break: break-all;
+  font-family: 'SF Mono', Monaco, monospace;
+  font-size: 12px;
 }
 </style>

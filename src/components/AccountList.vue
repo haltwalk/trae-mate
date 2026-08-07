@@ -42,6 +42,7 @@
         @toggle="handleToggle"
         @delete="handleDelete"
         @edit="handleEdit"
+        @notify="handleNotify"
       />
     </div>
 
@@ -78,6 +79,10 @@ async function handleCheckin(id: string) {
     const points = await store.getAccountPoints(id)
     emit('notify', points?.success ? '签到后总积分已更新' : (points?.message || '签到成功，但总积分查询失败'), points?.success ? 'success' : 'error')
   }
+}
+
+function handleNotify(message: string, type: 'success' | 'error') {
+  emit('notify', message, type)
 }
 
 async function handleToggle(id: string, enabled: boolean) {

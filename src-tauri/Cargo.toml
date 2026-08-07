@@ -22,7 +22,7 @@ cbc = "0.1"
 sha2 = { version = "0.10", features = ["oid"] }
 base64 = "0.22"
 chrono = "0.4"
-windows = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_System_Memory", "Win32_Foundation"] }
+windows = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_System_Memory", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 rsa = "0.9"
 rand = "0.8"
 hex = "0.4"
@@ -30,3 +30,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
 tauri-plugin-notification = "2"
 chrono-tz = "0.10"
+uuid = { version = "1", features = ["v4"] }
+tauri-plugin-dialog = "2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

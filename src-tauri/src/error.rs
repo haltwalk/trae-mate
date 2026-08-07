@@ -17,6 +17,8 @@ pub enum AppError {
     Dpapi(String),
     #[error("未找到账号: {0}")]
     NotFound(String),
+    #[error("多开启动失败: {0}")]
+    Launch(String),
 }
 
 impl Serialize for AppError {

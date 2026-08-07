@@ -548,6 +548,8 @@ mod e2e_tests {
             desktop_user_id: Some(cred.user_id.clone()),
             encrypted_credential: Some(encrypted),
             credential_status: None,
+            data_dir: None,
+            machine_id: None,
         };
         let state = AppState {
             data: Mutex::new(StoreData {

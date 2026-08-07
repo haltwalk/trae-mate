@@ -27,6 +27,12 @@ pub struct Account {
     pub encrypted_credential: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub credential_status: Option<String>, // "valid" | "expiring" | "expired"
+    /// 多开实例的独立 data-dir 路径(%APPDATA%\TRAE SOLO CN_{userId}),首次多开时生成并回写
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub data_dir: Option<String>,
+    /// 多开实例的机器码(每实例独立 UUID,不动系统注册表)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub machine_id: Option<String>,
 }
 
 /// 账号(脱敏,返回前端)。不含加密凭据。
@@ -44,6 +50,8 @@ pub struct PublicAccount {
     pub enabled: bool,
     pub desktop_user_id: Option<String>,
     pub credential_status: Option<String>,
+    pub data_dir: Option<String>,
+    pub machine_id: Option<String>,
 }
 
 impl From<Account> for PublicAccount {
@@ -60,6 +68,8 @@ impl From<Account> for PublicAccount {
             enabled: a.enabled,
             desktop_user_id: a.desktop_user_id,
             credential_status: a.credential_status,
+            data_dir: a.data_dir,
+            machine_id: a.machine_id,
         }
     }
 }
@@ -160,6 +170,15 @@ pub struct Credential {
     pub user_id: String,
     pub account_name: String,
     pub host: String,
+    /// 账号邮箱(多开写 storage.json 用,从桌面凭据 account 提取)
+    #[serde(default)]
+    pub email: Option<String>,
+    /// 头像 URL(多开写 storage.json 用)
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    /// 区域("CN"/"SG",多开写 storage.json 用,从 userRegion 或 host 推断)
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 /// 签到结果
@@ -180,6 +199,15 @@ pub struct PointsResult {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_points: Option<i64>,
+}
+
+/// 多开启动结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchResult {
+    pub data_dir: String,
+    pub machine_id: String,
+    pub launched: bool,
 }
 
 /// 凭证状态

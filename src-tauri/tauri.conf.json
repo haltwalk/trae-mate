@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "identifier": "com.traecheck.app",
   "build": {
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:1421",
     "frontendDist": "../dist",
     "beforeDevCommand": "pnpm dev",
     "beforeBuildCommand": "pnpm build"

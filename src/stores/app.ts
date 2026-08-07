@@ -14,6 +14,8 @@ export interface Account {
   enabled: boolean
   desktopUserId?: string
   credentialStatus?: 'valid' | 'expiring' | 'expired'
+  dataDir?: string
+  machineId?: string
 }
 
 export interface CheckinLog {
@@ -36,6 +38,12 @@ export interface PointsResult {
   success: boolean
   message: string
   totalPoints?: number
+}
+
+export interface LaunchResult {
+  dataDir: string
+  machineId: string
+  launched: boolean
 }
 
 export interface AppSettings {
@@ -62,6 +70,8 @@ export const useAppStore = defineStore('app', () => {
   const settings = ref<AppSettings | null>(null)
   const loading = ref(false)
   const checkingIn = ref(false)
+  const launching = ref(false) // 多开启动中
+  const instanceRefreshTick = ref(0) // 多开状态刷新信号:自增触发各卡片重查
   const nextRunTime = ref<string | null>(null)
 
   // 计算属性
@@ -195,6 +205,56 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  // 多开实例:用账号凭据启动免登录的独立 TRAE 实例
+  async function launchMulti(id: string) {
+    try {
+      launching.value = true
+      const result = await invoke<LaunchResult>('launch_account_multi', { id })
+      await fetchAccounts()
+      return result
+    } finally {
+      launching.value = false
+    }
+  }
+
+  // 查询账号多开实例是否在运行
+  async function isInstanceRunning(id: string): Promise<boolean> {
+    try {
+      return await invoke<boolean>('is_account_instance_running', { id })
+    } catch (e) {
+      console.error('查询实例运行状态失败:', e)
+      return false
+    }
+  }
+
+  // 触发所有账号卡片重新查询多开实例运行状态(关闭实例后状态不自动更新,手动刷新用)
+  function refreshInstances() {
+    instanceRefreshTick.value++
+  }
+
+  // 聚焦账号多开实例的窗口(提到前台)
+  async function focusInstance(id: string) {
+    await invoke('focus_account_instance', { id })
+  }
+
+  // TRAE 客户端路径
+  async function getTraeExePath(): Promise<string | null> {
+    try {
+      return await invoke<string | null>('get_trae_exe_path')
+    } catch (e) {
+      console.error('获取 TRAE 路径失败:', e)
+      return null
+    }
+  }
+
+  async function setTraeExePath(path: string) {
+    await invoke('set_trae_exe_path', { path })
+  }
+
+  async function scanTraeExePath(): Promise<string> {
+    return await invoke<string>('scan_trae_exe_path')
+  }
+
   // 初始化
   async function init() {
     loading.value = true
@@ -217,6 +277,8 @@ export const useAppStore = defineStore('app', () => {
     settings,
     loading,
     checkingIn,
+    launching,
+    instanceRefreshTick,
     nextRunTime,
     // 计算属性
     enabledAccounts,
@@ -234,6 +296,13 @@ export const useAppStore = defineStore('app', () => {
     fetchSettings,
     saveSettings,
     fetchNextRunTime,
+    launchMulti,
+    isInstanceRunning,
+    focusInstance,
+    refreshInstances,
+    getTraeExePath,
+    setTraeExePath,
+    scanTraeExePath,
     init
   }
 })

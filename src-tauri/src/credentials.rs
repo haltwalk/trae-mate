@@ -249,6 +249,9 @@ mod tests {
             user_id: "u1".into(),
             account_name: "test".into(),
             host: "https://example.com".into(),
+            email: None,
+            avatar_url: None,
+            region: None,
         };
         let encrypted = match encrypt_credential(&cred) {
             Ok(e) => e,

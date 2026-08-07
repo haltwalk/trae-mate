@@ -83,6 +83,16 @@
         </div>
         <div class="top-bar-right">
           <button
+            class="btn btn-outline"
+            @click="handleRefresh"
+            :disabled="refreshing"
+            v-if="activeTab === 'accounts'"
+            title="刷新账号与多开实例状态"
+          >
+            <Icon name="arrow-path" :size="16" :class="{ spinning: refreshing }" />
+            <span>刷新</span>
+          </button>
+          <button
             class="btn btn-primary"
             @click="handleCheckinAll"
             :disabled="store.checkingIn || store.enabledAccounts.length === 0"
@@ -106,7 +116,7 @@
       <div class="content-area">
         <AccountList v-if="activeTab === 'accounts'" @add-account="showAddModal = true" @notify="showToast" />
         <CheckinLog v-else-if="activeTab === 'logs'" />
-        <SettingsPanel v-else />
+        <SettingsPanel v-else @notify="showToast" />
       </div>
     </main>
     </div><!-- /app-body -->
@@ -181,6 +191,22 @@ async function handleCheckinAll() {
 
 function handleAddSuccess() {
   showAddModal.value = false
+}
+
+const refreshing = ref(false)
+
+// 刷新账号数据 + 触发各卡片重查多开实例运行状态(关闭实例后状态不自动更新,手动刷新)
+async function handleRefresh() {
+  if (refreshing.value) return
+  refreshing.value = true
+  try {
+    void store.fetchAccounts()
+    store.refreshInstances()
+  } catch (e) {
+    console.error('刷新失败:', e)
+  } finally {
+    setTimeout(() => { refreshing.value = false }, 600)
+  }
 }
 
 onMounted(() => {
@@ -489,5 +515,16 @@ onMounted(() => {
 
 .top-toast.error {
   background: var(--danger);
+}
+
+/* 刷新按钮图标旋转动画(:deep 穿透到 Icon 根 svg) */
+:deep(.spinning) {
+  animation: app-spin 0.8s linear infinite;
+}
+
+@keyframes app-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 </style>
