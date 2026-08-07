@@ -30,11 +30,10 @@ pnpm tauri build    # 打包成安装包
 
 ## 借鉴项目
 
-本项目的「多开实例」能力借鉴自以下开源项目,移植并适配了其中的加密信封、TRAE 路径扫描、进程启动/运行检测、机器码生成与窗口聚焦等逻辑:
+本项目在以下开源项目基础上开发 / 借鉴:
 
-- **[Trae-Work-CN-Account-Manager](https://github.com/xhrxgr/Trae-Work-CN-Account-Manager)** —— 多开 / 切换账号的核心实现(`encrypt_solo_cn_auth_info`、`machine.rs` 等)。其加密信封与本项目原有的 `decrypt_trae_auth_info` 同源(常量与 header 完全一致),故移植零风险。
-
-签到逻辑为本项目原有实现,非借鉴。
+- **[trae-check](https://github.com/inlayin/trae-check)** -- 项目基础。签到、账号管理、定时任务、积分查询、Neumorphism UI 等核心逻辑均源自此项目,本项目在其基础上新增多开实例、动态托盘菜单等能力并改名 TraeMate。
+- **[Trae-Work-CN-Account-Manager](https://github.com/xhrxgr/Trae-Work-CN-Account-Manager)** -- 「多开实例」能力借鉴自此项目,移植并适配了加密信封、TRAE 路径扫描、进程启动/运行检测、机器码生成与窗口聚焦等逻辑(`encrypt_solo_cn_auth_info`、`machine.rs` 等)。其加密信封与 `trae-check` 原有 `decrypt_trae_auth_info` 同源(常量与 header 完全一致),故移植零风险。
 
 ## 声明
 
