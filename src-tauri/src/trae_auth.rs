@@ -10,6 +10,7 @@
 //    明文 = digest(64) + payload(JSON);校验 digest == SHA512(payload)
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
@@ -289,6 +290,108 @@ pub fn read_credentials_from_data_dir(data_dir: &Path) -> AppResult<Credential> 
     })
 }
 
+/// 宽松读取 data-dir 登录信息:仅解密 iCubeAuthInfo,不要求 dc 签名密钥与 telemetry 完整,
+/// 缺失字段(签名密钥/deviceId/machineId 等)从 fallback 快照补齐。
+/// 用于工具实例目录(launch_multi 写入,无签名密钥)与主目录的 token 回读同步。
+pub fn read_auth_from_data_dir_loose(
+    data_dir: &Path,
+    fallback: &Credential,
+) -> AppResult<Credential> {
+    let storage_path = data_dir
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let raw = fs::read_to_string(&storage_path)?;
+    let storage: Value = serde_json::from_str(&raw)?;
+
+    let encrypted = storage
+        .get("iCubeAuthInfo://icube.cloudide")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Credential("TRAE desktop login information was not found".into()))?;
+    let auth_info = decrypt_trae_auth_info(encrypted)?;
+
+    let str_field = |k: &str| {
+        auth_info
+            .get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    let token = str_field("token")
+        .ok_or_else(|| AppError::Credential("TRAE desktop login token is invalid".into()))?;
+    let user_id = str_field("userId").unwrap_or_default();
+    let expires_at = parse_time_ms(auth_info.get("expiredAt"))?;
+    let refresh_expires_at = parse_time_ms(auth_info.get("refreshExpiredAt"))?;
+
+    let account_obj = auth_info.get("account");
+    let region = auth_info
+        .get("userRegion")
+        .and_then(|r| r.get("region"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| fallback.region.clone());
+
+    Ok(Credential {
+        token,
+        refresh_token: str_field("refreshToken").unwrap_or_else(|| fallback.refresh_token.clone()),
+        expires_at,
+        refresh_expires_at,
+        // telemetry 可能在工具目录中缺失/为多开占位值,统一兜底快照
+        device_id: storage
+            .get("telemetry.devDeviceId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| fallback.device_id.clone()),
+        machine_id: storage
+            .get("telemetry.machineId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| fallback.machine_id.clone()),
+        private_key_pem: fallback.private_key_pem.clone(),
+        public_key_pem: fallback.public_key_pem.clone(),
+        user_id,
+        account_name: account_obj
+            .and_then(|a| a.get("username"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| fallback.account_name.clone()),
+        host: str_field("host").unwrap_or_else(|| fallback.host.clone()),
+        email: account_obj
+            .and_then(|a| a.get("email"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| fallback.email.clone()),
+        avatar_url: account_obj
+            .and_then(|a| a.get("avatar_url"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| fallback.avatar_url.clone()),
+        region,
+    })
+}
+
+/// 读取主目录实例的 telemetry.devDeviceId(用于识别工具目录是否被污染为与主目录共用设备)。
+/// 设备 id 非敏感,仅做对照。失败返回 None。
+pub fn read_main_telemetry_device_id() -> Option<String> {
+    let appdata = env::var("APPDATA").ok()?;
+    let storage_path = PathBuf::from(&appdata)
+        .join("TRAE SOLO CN")
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let raw = fs::read_to_string(&storage_path).ok()?;
+    let storage: Value = serde_json::from_str(&raw).ok()?;
+    storage
+        .get("telemetry.devDeviceId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// 读取主目录实例当前登录的 userId(读 %APPDATA%\TRAE SOLO CN\...\storage.json 解密 iCubeAuthInfo)。
 /// 仅用于判断主实例登录账号:失败返回 None(主实例未登录/异常时不阻断状态判定)。
 pub fn read_main_instance_user_id() -> Option<String> {
@@ -365,11 +468,54 @@ mod tests {
         assert_ne!(a, b, "embedded_key 随机,同明文密文应不同");
     }
 
+    /// 诊断:打印真实 dc 签名密钥的 PEM 标签(仅标签行,不含密钥材料),确认密钥类型
+    #[test]
+    fn print_signing_key_pem_labels() {
+        let appdata = match env::var("APPDATA") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("[trae_auth] 非 Windows 环境,跳过");
+                return;
+            }
+        };
+        let storage_path = PathBuf::from(&appdata)
+            .join("TRAE SOLO CN")
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        if !storage_path.exists() {
+            eprintln!("[trae_auth] 未找到 TRAE storage.json,跳过");
+            return;
+        }
+        let raw = std::fs::read_to_string(&storage_path).unwrap();
+        let storage: Value = serde_json::from_str(&raw).unwrap();
+        let encoded = storage
+            .as_object()
+            .and_then(|obj| {
+                obj.iter().find_map(|(k, v)| {
+                    if k.starts_with("iCubeAuthInfo://icube-dc:") {
+                        v.as_str()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .expect("无 dc 签名密钥");
+        let key = decrypt_trae_auth_info(encoded).expect("解密失败");
+        for field in ["privateKeyPEM", "publicKeyPEM"] {
+            let pem = key.get(field).and_then(|v| v.as_str()).unwrap_or("");
+            let label = pem
+                .lines()
+                .find(|l| l.starts_with("-----BEGIN"))
+                .unwrap_or("(无 PEM 标签)");
+            eprintln!("[trae_auth] {field} 标签: {label} (长度 {})", pem.len());
+        }
+    }
+
     /// 用本机真实 storage.json 验证解密链路。不输出任何敏感值,
     /// 仅断言能解出非空 token/userId/host(说明算法正确)。
     #[test]
-    fn decrypt_real_trae_storage() {
-        let appdata = match env::var("APPDATA") {
+    fn decrypt_real_trae_storage() {        let appdata = match env::var("APPDATA") {
             Ok(v) => v,
             Err(_) => {
                 eprintln!("[trae_auth] 非 Windows 环境,跳过");

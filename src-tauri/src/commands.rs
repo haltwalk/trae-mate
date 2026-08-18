@@ -8,7 +8,7 @@ use crate::checkin;
 use crate::credentials;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    credential_status, Account, AppSettings, CheckinLog, CheckinResult, LaunchResult,
+    credential_status, Account, AppSettings, CheckinLog, CheckinResult, Credential, LaunchResult,
     PartialAppSettings, PointsResult, PublicAccount,
 };
 use crate::scheduler;
@@ -72,6 +72,17 @@ pub fn update_account(
 
 #[tauri::command]
 pub fn delete_account(id: String, state: State<'_, AppState>, app: AppHandle) -> AppResult<bool> {
+    // 关闭该账号的工具实例(若在运行),数据目录保留(用户可日后通过"扫描已有多开目录"重新导入)
+    {
+        let data = state.data.lock().unwrap();
+        if let Some(acc) = data.get_accounts().iter().find(|a| a.id == id) {
+            if let Some(dir) = acc.data_dir.as_deref().filter(|s| !s.is_empty()) {
+                if trae_machine::is_instance_running(dir).0 {
+                    let _ = trae_machine::kill_instance(dir);
+                }
+            }
+        }
+    }
     let mut data = state.data.lock().unwrap();
     data.delete_account(&id);
     data.save(&state.path)?;
@@ -263,12 +274,23 @@ pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<Laun
         });
     }
 
-    // 4. 独立目录多开:解密凭据 -> launch_multi(写凭据到 TRAE SOLO CN_{userId})
+    // 4. 独立目录多开:解密凭据 -> 回读实例目录最新凭据(TRAE 可能自己刷新过,避免旧快照覆盖) -> launch_multi(写凭据到 TRAE SOLO CN_{userId})
     let encrypted = account
         .encrypted_credential
         .as_ref()
         .ok_or_else(|| AppError::Launch("该账号尚未导入 TRAE 桌面凭证,无法启动".into()))?;
-    let cred = credentials::decrypt_credential(encrypted)?;
+    let decrypted = credentials::decrypt_credential(encrypted)?;
+    let (cred, adopted) = trae_instance::sync_credential_from_instance(&account, &decrypted);
+    // 回读到更新凭据时同步应用存储,下次签到直接用新值
+    if adopted {
+        let encrypted_new = credentials::encrypt_credential(&cred)?;
+        let mut data = state.data.lock().unwrap();
+        let _ = data.update_account(
+            account_id,
+            serde_json::json!({ "encryptedCredential": encrypted_new }),
+        );
+        let _ = data.save(&state.path);
+    }
     let result = trae_instance::launch_multi(&account, &cred, &exe_path)?;
 
     // 5. 回写 data_dir/machine_id(首次启动时绑定,后续复用同一目录与机器码)
@@ -549,4 +571,123 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
         "name": cred.account_name,
         "userId": user_id
     })
+}
+
+/// 手动刷新账号凭证(卡片"刷新凭证"按钮):实例目录回读 + ExchangeToken 刷新 + 回写
+#[tauri::command]
+pub async fn refresh_account_credential(
+    id: String,
+    state: State<'_, AppState>,
+    client: State<'_, reqwest::Client>,
+) -> AppResult<PublicAccount> {
+    let account = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts().iter().find(|a| a.id == id).cloned()
+    }
+    .ok_or_else(|| AppError::NotFound(id.clone()))?;
+    checkin::refresh_account_credential(&account, client.inner(), state.inner()).await?;
+    let acc = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts()
+            .iter()
+            .find(|a| a.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(id.clone()))?
+    };
+    Ok(acc.into())
+}
+
+/// 扫描 %APPDATA% 下已存在的多开/登录临时目录,标注是否已绑定应用内账号
+#[tauri::command]
+pub fn scan_instance_dirs(state: State<'_, AppState>) -> Vec<trae_instance::InstanceDirInfo> {
+    let mut dirs = trae_instance::scan_instance_dirs();
+    let accounts = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts().to_vec()
+    };
+    for d in &mut dirs {
+        d.bound = accounts.iter().any(|a| {
+            a.data_dir.as_deref() == Some(d.data_dir.as_str())
+                || (!d.user_id.is_empty()
+                    && a.desktop_user_id.as_deref() == Some(d.user_id.as_str()))
+        });
+    }
+    dirs
+}
+
+/// 从已有多开目录导入账号(扫描列表的"导入"入口):
+/// 完整凭据优先,缺失签名密钥时退宽松读取(token 可用但过期后无法自动刷新)。
+/// 同 userId 账号已存在则仅更新凭据并绑定目录,保留名称/积分/签到历史。
+#[tauri::command]
+pub fn import_account_from_dir(
+    data_dir: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> AppResult<PublicAccount> {
+    let path = PathBuf::from(&data_dir);
+    if !path
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json")
+        .exists()
+    {
+        return Err(AppError::NotFound(format!("目录无 storage.json: {data_dir}")));
+    }
+    let cred = trae_auth::read_credentials_from_data_dir(&path)
+        .or_else(|_| trae_auth::read_auth_from_data_dir_loose(&path, &Credential::empty()))?;
+    if cred.user_id.is_empty() {
+        return Err(AppError::Credential("目录登录信息缺少 userId".into()));
+    }
+
+    let encrypted = credentials::encrypt_credential(&cred)?;
+    let now = now_ms();
+    let status = credential_status(cred.expires_at, now);
+    let machine_id = if cred.machine_id.is_empty() {
+        None
+    } else {
+        Some(cred.machine_id.clone())
+    };
+
+    let mut data = state.data.lock().unwrap();
+    let existing = data
+        .get_accounts()
+        .iter()
+        .find(|a| a.desktop_user_id.as_deref() == Some(cred.user_id.as_str()))
+        .cloned();
+    let saved = match existing {
+        Some(acc) => data
+            .update_account(
+                &acc.id,
+                serde_json::json!({
+                    "encryptedCredential": encrypted,
+                    "credentialStatus": status,
+                    "dataDir": data_dir,
+                    "machineId": machine_id,
+                }),
+            )
+            .ok_or_else(|| AppError::NotFound(acc.id.clone()))?,
+        None => {
+            let account = Account {
+                id: generate_id(),
+                name: cred.account_name.clone(),
+                cookie: String::new(),
+                created_at: now,
+                last_checkin_at: None,
+                last_checkin_result: None,
+                last_checkin_message: None,
+                points: None,
+                enabled: true,
+                desktop_user_id: Some(cred.user_id.clone()),
+                encrypted_credential: Some(encrypted),
+                credential_status: Some(status.to_string()),
+                data_dir: Some(data_dir.clone()),
+                machine_id,
+            };
+            data.upsert_desktop_account(account)
+        }
+    };
+    data.save(&state.path)?;
+    drop(data);
+    let _ = crate::rebuild_tray_menu(&app);
+    Ok(saved.into())
 }

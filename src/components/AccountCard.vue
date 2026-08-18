@@ -36,8 +36,18 @@
       </div>
       <div class="info-row" v-if="account.credentialStatus">
         <span class="info-label">桌面凭证</span>
-        <span class="info-value" :class="account.credentialStatus === 'expired' ? 'text-danger' : 'text-success'">
-          {{ credentialStatusText }}
+        <span class="cred-value-wrap">
+          <span class="info-value" :class="account.credentialStatus === 'expired' ? 'text-danger' : 'text-success'">
+            {{ credentialStatusText }}
+          </span>
+          <button
+            class="btn-refresh-cred"
+            title="回读 TRAE 最新凭证(打开 TRAE 让它自行刷新后,点此同步)"
+            @click="handleRefreshCred"
+            :disabled="refreshingCred"
+          >
+            <Icon name="arrow-path" :size="11" :class="{ spinning: refreshingCred }" />
+          </button>
         </span>
       </div>
     </div>
@@ -47,7 +57,7 @@
       <button
         class="btn btn-sm btn-primary"
         @click="handleCheckin"
-        :disabled="checkingIn || !account.enabled"
+        :disabled="checkingIn || store.checkingIn || !account.enabled"
       >
         <span v-if="checkingIn" class="spinner"></span>
         <span>{{ checkingIn ? '签到中' : '立即签到' }}</span>
@@ -95,11 +105,12 @@ const props = defineProps<{
   account: Account
 }>()
 
-const emit = defineEmits(['checkin', 'toggle', 'delete', 'edit', 'notify'])
+const emit = defineEmits(['toggle', 'delete', 'edit', 'notify'])
 const store = useAppStore()
 
 const checkingIn = ref(false)
 const launching = ref(false)
+const refreshingCred = ref(false)
 const instanceState = ref<InstanceState>({ running: false, source: 'none', isMainAccount: false })
 
 onMounted(async () => {
@@ -145,8 +156,8 @@ const lastCheckinText = computed(() => {
 })
 
 const credentialStatusText = computed(() => {
-  if (props.account.credentialStatus === 'expired') return '凭证已失效，请重新导入'
-  if (props.account.credentialStatus === 'expiring') return '凭证即将续期'
+  if (props.account.credentialStatus === 'expired') return '凭证已失效，请打开 TRAE 实例刷新'
+  if (props.account.credentialStatus === 'expiring') return '凭证即将过期，打开 TRAE 实例续期'
   return '凭证有效'
 })
 
@@ -154,14 +165,25 @@ function handleToggle() {
   emit('toggle', props.account.id, !props.account.enabled)
 }
 
+// 签到由卡片自身执行并等待完成,按钮在整个请求期间保持禁用(防止连点触发服务端限频)
 async function handleCheckin() {
+  if (checkingIn.value) return
   checkingIn.value = true
   try {
-    emit('checkin', props.account.id)
+    const result = await store.checkinAccount(props.account.id)
+    let msg = result?.message || (result?.success ? '签到成功' : '签到失败')
+    if (msg.includes('频繁')) msg += ',请稍候一分钟再试'
+    emit('notify', msg, result?.success ? 'success' : 'error')
+    if (result?.success) {
+      const points = await store.getAccountPoints(props.account.id)
+      emit('notify',
+        points?.success ? '签到后总积分已更新' : (points?.message || '签到成功，但总积分查询失败'),
+        points?.success ? 'success' : 'error')
+    }
+  } catch (e: any) {
+    emit('notify', '签到失败: ' + (e?.message || e), 'error')
   } finally {
-    setTimeout(() => {
-      checkingIn.value = false
-    }, 1000)
+    checkingIn.value = false
   }
 }
 
@@ -190,6 +212,20 @@ async function handleFocus() {
 
 function handleDelete() {
   emit('delete', props.account.id)
+}
+
+// 回读最新凭证:打开 TRAE 实例让它自行刷新 token,点此同步到应用(应用不主动刷新 token)
+async function handleRefreshCred() {
+  if (refreshingCred.value) return
+  refreshingCred.value = true
+  try {
+    await store.refreshCredential(props.account.id)
+    emit('notify', '已回读 TRAE 最新凭证', 'success')
+  } catch (e: any) {
+    emit('notify', '回读凭证失败: ' + (e?.message || e), 'error')
+  } finally {
+    refreshingCred.value = false
+  }
 }
 
 function startEdit() { draftName.value = props.account.name; editing.value = true }
@@ -332,6 +368,52 @@ function formatDateTime(timestamp: number): string {
 .info-value.points {
   color: var(--warning);
   font-weight: 700;
+}
+
+/* 桌面凭证行:状态 + 手动刷新小按钮 */
+.cred-value-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-refresh-cred {
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface);
+  color: var(--text-muted);
+  box-shadow: var(--shadow-soft-raised);
+  transition: box-shadow var(--t-press), color var(--t-smooth);
+  flex-shrink: 0;
+}
+
+.btn-refresh-cred:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+.btn-refresh-cred:active:not(:disabled) {
+  box-shadow: var(--shadow-soft-inset);
+}
+
+.btn-refresh-cred:disabled {
+  cursor: default;
+  color: var(--accent);
+}
+
+.spinning {
+  animation: cred-spin 0.8s linear infinite;
+}
+
+@keyframes cred-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .text-success {

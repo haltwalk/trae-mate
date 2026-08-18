@@ -52,6 +52,19 @@ export interface InstanceState {
   isMainAccount: boolean
 }
 
+export interface InstanceDirInfo {
+  dataDir: string
+  userId: string
+  accountName: string
+  /** token 过期时间(毫秒),0 表示未知 */
+  expiresAt: number
+  /** 含设备签名密钥(可刷新 token);false 则 token 过期后需重新登录 */
+  hasSigningKey: boolean
+  running: boolean
+  /** 已被应用内账号绑定(同 dataDir 或同 userId) */
+  bound: boolean
+}
+
 export interface AppSettings {
   autoCheckin: boolean
   checkinTime: string
@@ -129,7 +142,18 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  // 在途签到的账号 id(防连点重复请求触发服务端限频)
+  const checkingIds = new Set<string>()
+
   async function checkinAccount(id: string) {
+    if (checkingIds.has(id)) {
+      return { success: false, message: '该账号签到进行中，请稍候' } as CheckinResult
+    }
+    // 一键签到进行中不接受单账号签到,避免并发请求触发限频
+    if (checkingIn.value) {
+      return { success: false, message: '一键签到进行中，请稍候' } as CheckinResult
+    }
+    checkingIds.add(id)
     try {
       checkingIn.value = true
       const result = await invoke<CheckinResult>('checkin_account', { id })
@@ -138,6 +162,7 @@ export const useAppStore = defineStore('app', () => {
       return result
     } finally {
       checkingIn.value = false
+      checkingIds.delete(id)
     }
   }
 
@@ -237,6 +262,30 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  // 扫描 %APPDATA% 下已存在的多开/登录临时目录(含登录信息的)
+  async function scanInstanceDirs(): Promise<InstanceDirInfo[]> {
+    try {
+      return await invoke<InstanceDirInfo[]>('scan_instance_dirs')
+    } catch (e) {
+      console.error('扫描多开目录失败:', e)
+      return []
+    }
+  }
+
+  // 从已有多开目录导入账号(同 userId 已存在则更新凭据并绑定目录)
+  async function importAccountFromDir(dataDir: string) {
+    const result = await invoke<Account>('import_account_from_dir', { dataDir })
+    await fetchAccounts()
+    return result
+  }
+
+  // 手动刷新账号凭证(实例目录回读 + ExchangeToken 刷新 + 回写)
+  async function refreshCredential(id: string) {
+    const result = await invoke<Account>('refresh_account_credential', { id })
+    await fetchAccounts()
+    return result
+  }
+
   // 查询账号实例运行状态(含来源:主实例/工具实例/未运行)
   async function getInstanceState(id: string): Promise<InstanceState> {
     try {
@@ -319,6 +368,9 @@ export const useAppStore = defineStore('app', () => {
     fetchNextRunTime,
     launchMulti,
     openNewLoginInstance,
+    scanInstanceDirs,
+    importAccountFromDir,
+    refreshCredential,
     getInstanceState,
     focusInstance,
     refreshInstances,

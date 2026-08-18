@@ -38,7 +38,6 @@
         v-for="account in store.accounts"
         :key="account.id"
         :account="account"
-        @checkin="handleCheckin"
         @toggle="handleToggle"
         @delete="handleDelete"
         @edit="handleEdit"
@@ -71,15 +70,6 @@ const emit = defineEmits(['add-account', 'notify'])
 const totalPoints = computed(() => {
   return store.accounts.reduce((sum, a) => sum + (a.points || 0), 0)
 })
-
-async function handleCheckin(id: string) {
-  const result = await store.checkinAccount(id)
-  emit('notify', result?.success ? (result.message || '签到成功') : (result?.message || '签到失败'), result?.success ? 'success' : 'error')
-  if (result?.success) {
-    const points = await store.getAccountPoints(id)
-    emit('notify', points?.success ? '签到后总积分已更新' : (points?.message || '签到成功，但总积分查询失败'), points?.success ? 'success' : 'error')
-  }
-}
 
 function handleNotify(message: string, type: 'success' | 'error') {
   emit('notify', message, type)

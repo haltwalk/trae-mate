@@ -1,20 +1,10 @@
-// 凭据加密存储(DPAPI)与刷新(RSA-SHA256 签名)。移植自 desktop-credentials.cjs。
+// 凭据加密存储(DPAPI)。token 的刷新由 TRAE 客户端负责(运行时会自行写回 storage.json),
+// 本应用仅通过 checkin/trae_instance 回读,不主动调 ExchangeToken。
 
 use base64::{engine::general_purpose, Engine as _};
-use rand::RngCore;
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::pkcs1v15::SigningKey;
-use rsa::signature::{Signer, SignatureEncoding};
-use rsa::RsaPrivateKey;
-use serde_json::{json, Value};
-use sha2::Sha256;
 
 use crate::error::{AppError, AppResult};
 use crate::models::Credential;
-
-const CLIENT_ID: &str = "en1oxy7wnw8j9n";
-const REFRESH_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
 
 // ===== DPAPI(Windows) =====
 // NOTE: windows 0.61 未导出 CRYPTPROTECT_FLAGS/LocalFree/HLOCAL(实测 dwflags 为 u32)。
@@ -86,134 +76,6 @@ pub fn decrypt_credential(encoded: &str) -> AppResult<Credential> {
     let plain = dpapi_unprotect(&bytes)?;
     let cred: Credential = serde_json::from_slice(&plain)?;
     Ok(cred)
-}
-
-// ===== 刷新 =====
-
-fn load_private_key(pem: &str) -> AppResult<RsaPrivateKey> {
-    RsaPrivateKey::from_pkcs8_pem(pem)
-        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
-        .map_err(|e| AppError::Credential(format!("加载 RSA 私钥失败: {e}")))
-}
-
-/// 用 RSA-SHA256(PKCS#1 v1.5) 签名,对应原 crypto.sign('sha256', payload, privateKey)
-fn sign_sha256(private_key: RsaPrivateKey, payload: &[u8]) -> AppResult<Vec<u8>> {
-    let signing_key = SigningKey::<Sha256>::new(private_key);
-    let signature = signing_key.sign(payload);
-    Ok(signature.to_bytes().to_vec())
-}
-
-pub async fn refresh_credential(
-    cred: &Credential,
-    client: &reqwest::Client,
-) -> AppResult<Credential> {
-    let timestamp = chrono::Utc::now().timestamp();
-    let mut nonce_bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = hex::encode(nonce_bytes);
-
-    // 签名载荷:POST\n{path}\n{clientId}\n{refreshToken}\n{timestamp}\n{nonce}
-    let signature_payload = format!(
-        "POST\n{}\n{}\n{}\n{}\n{}",
-        REFRESH_PATH, CLIENT_ID, cred.refresh_token, timestamp, nonce
-    );
-
-    let private_key = load_private_key(&cred.private_key_pem)?;
-    let signature = sign_sha256(private_key, signature_payload.as_bytes())?;
-    let signature_b64 = general_purpose::STANDARD.encode(&signature);
-
-    let device_name = std::env::var("USERNAME").unwrap_or_else(|_| "trae-check".into());
-    let body = json!({
-        "ClientID": CLIENT_ID,
-        "ClientSecret": "",
-        "RefreshToken": cred.refresh_token,
-        "DeviceInfo": {
-            "DeviceID": cred.device_id,
-            "MachineID": cred.machine_id,
-            "PlatformCode": "SOLO_PC",
-            "DeviceType": "PC",
-            "DeviceName": device_name,
-            "DeviceModel": "",
-            "ClientVersion": "0.1.43",
-            "DevicePublicKey": cred.public_key_pem,
-            "DeviceBrand": "",
-            "DeviceCPU": "",
-            "OSInfo": "Windows_NT",
-            "OSVersion": "10.0"
-        },
-        "DeviceProof": {
-            "Signature": signature_b64,
-            "Timestamp": timestamp,
-            "Nonce": nonce
-        },
-        "IDEVersion": "0.1.43"
-    });
-
-    let url = format!("{}{}", cred.host, REFRESH_PATH);
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("x-cloudide-token", &cred.token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Http(e.to_string()))?;
-
-    let data: Value = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Http(format!("解析刷新响应失败: {e}")))?;
-
-    let result = data
-        .get("Result")
-        .ok_or_else(|| AppError::Credential("刷新响应缺少 Result".into()))?;
-    let token = result
-        .get("Token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Credential("刷新响应缺少 Token".into()))?;
-    let refresh_token = result
-        .get("RefreshToken")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Credential("刷新响应缺少 RefreshToken".into()))?;
-    let expires_at = parse_expiry(result.get("TokenExpireAt"))?;
-    let refresh_expires_at = parse_expiry(result.get("RefreshExpireAt"))?;
-
-    Ok(Credential {
-        token: token.to_string(),
-        refresh_token: refresh_token.to_string(),
-        expires_at,
-        refresh_expires_at,
-        ..cred.clone()
-    })
-}
-
-/// 解析过期时间:数字(毫秒)或 ISO 字符串
-fn parse_expiry(v: Option<&Value>) -> AppResult<i64> {
-    let v = v.ok_or_else(|| AppError::Credential("缺少过期时间".into()))?;
-    if let Some(n) = v.as_i64() {
-        return Ok(n);
-    }
-    if let Some(f) = v.as_f64() {
-        return Ok(f as i64);
-    }
-    if let Some(s) = v.as_str() {
-        if let Ok(n) = s.parse::<i64>() {
-            return Ok(n);
-        }
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-            return Ok(dt.timestamp_millis());
-        }
-        for fmt in &[
-            "%Y-%m-%dT%H:%M:%SZ",
-            "%Y-%m-%dT%H:%M:%S%.3fZ",
-            "%Y-%m-%dT%H:%M:%S",
-        ] {
-            if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-                return Ok(ndt.and_utc().timestamp_millis());
-            }
-        }
-    }
-    Err(AppError::Credential(format!("无效的过期时间: {v}")))
 }
 
 #[cfg(test)]

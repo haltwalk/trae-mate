@@ -188,6 +188,28 @@ pub struct Credential {
     pub region: Option<String>,
 }
 
+impl Credential {
+    /// 空占位凭据:宽松回读目录登录信息时的兜底(缺失字段补空值)
+    pub fn empty() -> Self {
+        Self {
+            token: String::new(),
+            refresh_token: String::new(),
+            expires_at: 0,
+            refresh_expires_at: 0,
+            device_id: String::new(),
+            machine_id: String::new(),
+            private_key_pem: String::new(),
+            public_key_pem: String::new(),
+            user_id: String::new(),
+            account_name: String::new(),
+            host: String::new(),
+            email: None,
+            avatar_url: None,
+            region: None,
+        }
+    }
+}
+
 /// 签到结果
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

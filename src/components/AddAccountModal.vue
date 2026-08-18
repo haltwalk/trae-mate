@@ -31,17 +31,52 @@
             <span>启用自动签到</span>
           </label>
         </div>
+
+        <!-- 扫描已有多开目录 -->
+        <div class="form-group" v-if="scannedDirs !== null">
+          <label class="form-label">已有多开目录({{ scannedDirs.length }})</label>
+          <p v-if="scannedDirs.length === 0" class="scan-empty">
+            未发现含登录信息的多开目录(%APPDATA%\TRAE SOLO CN_*)
+          </p>
+          <div v-for="d in scannedDirs" :key="d.dataDir" class="scan-row">
+            <div class="scan-info">
+              <div class="scan-name">
+                {{ d.accountName || d.userId || '(未命名)' }}
+                <span v-if="d.bound" class="scan-badge">已导入</span>
+              </div>
+              <div class="scan-meta">
+                {{ shortDir(d.dataDir) }} · {{ d.running ? '运行中' : '未运行' }} ·
+                {{ expireText(d.expiresAt) }}
+              </div>
+            </div>
+            <button
+              class="btn btn-sm btn-outline"
+              @click="importDir(d)"
+              :disabled="importingDir !== null"
+            >
+              {{ importingDir === d.dataDir ? '导入中' : d.bound ? '更新' : '导入' }}
+            </button>
+          </div>
+        </div>
       </div>
 
       <div class="modal-footer">
-        <button class="btn btn-secondary" @click="handleClose">取消</button>
-        <button class="btn btn-outline" @click="openNewLoginInstance" :disabled="submitting">
-          打开新实例登录
-        </button>
-        <button class="btn btn-primary" @click="importDesktopAccount" :disabled="submitting">
-          <span v-if="submitting" class="spinner"></span>
-          <span>{{ submitting ? '导入中...' : '导入当前 TRAE 桌面账号' }}</span>
-        </button>
+        <div class="footer-row">
+          <button class="btn btn-outline" @click="scanDirs" :disabled="scanning">
+            <span v-if="scanning" class="spinner"></span>
+            <span>{{ scanning ? '扫描中...' : '扫描已有多开目录' }}</span>
+          </button>
+          <button class="btn btn-outline" @click="openNewLoginInstance" :disabled="submitting">
+            打开新实例登录
+          </button>
+        </div>
+        <div class="footer-row">
+          <button class="btn btn-secondary" @click="handleClose">取消</button>
+          <button class="btn btn-primary" @click="importDesktopAccount" :disabled="submitting">
+            <span v-if="submitting" class="spinner"></span>
+            <span>{{ submitting ? '导入中...' : '导入当前 TRAE 桌面账号' }}</span>
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -49,7 +84,7 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { useAppStore } from '../stores/app'
+import { useAppStore, type InstanceDirInfo } from '../stores/app'
 import Icon from './Icon.vue'
 
 const props = defineProps<{
@@ -66,10 +101,15 @@ const form = ref({
 })
 
 const submitting = ref(false)
+// 扫描已有多开目录:null 未扫描,[] 扫描后无结果
+const scannedDirs = ref<InstanceDirInfo[] | null>(null)
+const scanning = ref(false)
+const importingDir = ref<string | null>(null)
 
 watch(() => props.visible, (val) => {
   if (val) {
     form.value = { name: '', enabled: true }
+    scannedDirs.value = null
   }
 })
 
@@ -96,6 +136,44 @@ async function openNewLoginInstance() {
   } catch (e: any) {
     emit('notify', '打开实例失败: ' + (e?.message || e), 'error')
   }
+}
+
+async function scanDirs() {
+  scanning.value = true
+  try {
+    scannedDirs.value = await store.scanInstanceDirs()
+  } finally {
+    scanning.value = false
+  }
+}
+
+async function importDir(d: InstanceDirInfo) {
+  importingDir.value = d.dataDir
+  try {
+    await store.importAccountFromDir(d.dataDir)
+    emit('notify', `账号「${d.accountName || d.userId}」已从目录导入`, 'success')
+    emit('success')
+    // 重新扫描刷新"已导入"标记
+    scannedDirs.value = await store.scanInstanceDirs()
+  } catch (e: any) {
+    emit('notify', '导入失败: ' + (e?.message || e), 'error')
+  } finally {
+    importingDir.value = null
+  }
+}
+
+// 目录全路径过长,仅显示最后一段
+function shortDir(dir: string): string {
+  const parts = dir.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || dir
+}
+
+function expireText(ms: number): string {
+  if (!ms) return '过期时间未知'
+  const d = new Date(ms)
+  const diff = ms - Date.now()
+  const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  return diff <= 0 ? `已过期(${dateStr})` : `有效期至 ${dateStr}`
 }
 </script>
 
@@ -239,9 +317,78 @@ async function openNewLoginInstance() {
 
 .modal-footer {
   display: flex;
-  justify-content: flex-end;
+  flex-direction: column;
   gap: 10px;
   padding: 16px 24px;
   box-shadow: inset 0 2px 5px var(--shadow-light);
+}
+
+/* 两行布局:上行次级操作,下行取消+主操作;行内按钮等宽铺满 */
+.footer-row {
+  display: flex;
+  gap: 10px;
+}
+
+.footer-row .btn {
+  flex: 1;
+}
+
+/* 扫描结果列表 - 凹槽行,Neumorphism 软阴影 */
+.scan-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.scan-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft-inset);
+  margin-bottom: 8px;
+}
+
+.scan-row:last-child {
+  margin-bottom: 0;
+}
+
+.scan-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.scan-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.scan-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: var(--r-pill, 999px);
+  color: var(--accent);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft-flat);
+}
+
+.scan-meta {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scan-warn {
+  color: var(--warning);
 }
 </style>

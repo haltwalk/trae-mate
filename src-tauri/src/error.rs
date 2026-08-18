@@ -11,8 +11,6 @@ pub enum AppError {
     Serde(#[from] serde_json::Error),
     #[error("TRAE 桌面凭证错误: {0}")]
     Credential(String),
-    #[error("网络请求失败: {0}")]
-    Http(String),
     #[error("Windows DPAPI 错误: {0}")]
     Dpapi(String),
     #[error("未找到账号: {0}")]

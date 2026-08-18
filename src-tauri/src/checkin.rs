@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::credentials::{decrypt_credential, encrypt_credential, refresh_credential};
+use crate::credentials::{decrypt_credential, encrypt_credential};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     credential_status, Account, CheckinLog, CheckinResult, Credential, PointsResult, PublicAccount,
@@ -35,10 +35,74 @@ fn api_succeeded(data: &Value) -> bool {
         || data.get("status").and_then(|v| v.as_str()).map(|s| s == "success").unwrap_or(false)
 }
 
-/// 解密凭据;若即将过期(<=5min)则刷新并回写。失败时回写 expired 状态。
+/// 将回读采纳的凭据加密回写应用存储(应用不主动刷新 token,不回写实例目录)
+fn persist_credential(state: &AppState, account: &Account, cred: &Credential) {
+    let status = credential_status(cred.expires_at, now_ms());
+    let Ok(new_encrypted) = encrypt_credential(cred) else {
+        return;
+    };
+    let mut data = state.data.lock().unwrap();
+    data.update_account(
+        &account.id,
+        json!({ "encryptedCredential": new_encrypted, "credentialStatus": status }),
+    );
+    let _ = data.save(&state.path);
+}
+
+/// 标记账号凭证失效(刷新失败时)
+fn mark_credential_expired(state: &AppState, account_id: &str) {
+    let mut data = state.data.lock().unwrap();
+    data.update_account(account_id, json!({ "credentialStatus": "expired" }));
+    let _ = data.save(&state.path);
+}
+
+/// 判断是否为鉴权失败:HTTP 401/403,或业务码/消息指向 token 失效/未登录
+fn is_auth_failure(http_status: u16, data: Option<&Value>) -> bool {
+    if http_status == 401 || http_status == 403 {
+        return true;
+    }
+    let Some(d) = data else {
+        return false;
+    };
+    let code = d
+        .get("code")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            d.get("code")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+        });
+    if code == Some(401) || code == Some(403) {
+        return true;
+    }
+    let msg = d
+        .get("message")
+        .or_else(|| d.get("msg"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    // 限频/风控不是凭证问题,不当作鉴权失败(避免误标"token 已失效")
+    if msg.contains("频繁") || msg.contains("frequent") || msg.contains("too many") {
+        return false;
+    }
+    [
+        "unauthorized",
+        "token",
+        "expired",
+        "not login",
+        "not logged",
+        "登录",
+        "鉴权",
+    ]
+    .iter()
+    .any(|k| msg.contains(k))
+}
+
+/// 解密凭据并保持最新:先从实例目录回读(TRAE 客户端运行时会自行刷新 token 并写回 storage.json,
+/// 应用只负责回读,不主动调 ExchangeToken)。
+/// token 已过期时返回明确指引:请打开该账号的 TRAE 实例让客户端刷新后再试。
 async fn get_valid_credential(
     account: &Account,
-    client: &reqwest::Client,
     state: &AppState,
 ) -> AppResult<Credential> {
     let encrypted = account
@@ -47,27 +111,18 @@ async fn get_valid_credential(
         .ok_or_else(|| AppError::Credential("该账号尚未导入 TRAE 桌面凭证".into()))?;
     let mut cred = decrypt_credential(encrypted)?;
     let now = now_ms();
-    if cred.expires_at - now <= 5 * 60 * 1000 {
-        match refresh_credential(&cred, client).await {
-            Ok(refreshed) => {
-                let new_encrypted = encrypt_credential(&refreshed)?;
-                let status = credential_status(refreshed.expires_at, now);
-                let mut data = state.data.lock().unwrap();
-                data.update_account(
-                    &account.id,
-                    json!({ "encryptedCredential": new_encrypted, "credentialStatus": status }),
-                );
-                let _ = data.save(&state.path);
-                drop(data);
-                cred = refreshed;
-            }
-            Err(_) => {
-                let mut data = state.data.lock().unwrap();
-                data.update_account(&account.id, json!({ "credentialStatus": "expired" }));
-                let _ = data.save(&state.path);
-                return Err(AppError::Credential("凭证已失效，请重新导入".into()));
-            }
-        }
+    // 实例目录回读:目录有最新凭据则采纳。目录凭据未过期(即使比快照早)也应采纳——
+    // 快照可能是之前误标的 expired,自愈恢复
+    let (synced, adopted) = crate::trae_instance::sync_credential_from_instance(account, &cred);
+    if synced.expires_at > now || adopted {
+        persist_credential(state, account, &synced);
+        cred = synced;
+    }
+    if cred.expires_at <= now {
+        mark_credential_expired(state, &account.id);
+        return Err(AppError::Credential(
+            "token 已过期，请打开该账号的 TRAE 实例（TRAE 会自动刷新），刷新后重试".into(),
+        ));
     }
     Ok(cred)
 }
@@ -90,13 +145,40 @@ fn auth_headers(cred: &Credential) -> reqwest::header::HeaderMap {
     h
 }
 
-/// 单账号签到(桌面凭据模式)
+/// 手动刷新账号凭证:仅从实例目录回读最新凭据(TRAE 客户端运行时会自行刷新 token 并写回
+/// storage.json),采纳更新凭据回写应用存储。应用自身不调 ExchangeToken 刷新。
+pub async fn refresh_account_credential(
+    account: &Account,
+    client: &reqwest::Client,
+    state: &AppState,
+) -> AppResult<Credential> {
+    let _ = client;
+    let encrypted = account
+        .encrypted_credential
+        .as_ref()
+        .ok_or_else(|| AppError::Credential("该账号尚未导入 TRAE 桌面凭证".into()))?;
+    let cred = decrypt_credential(encrypted)?;
+    // 回读实例目录:目录凭据未过期则采纳(修复快照被误标 expired 后无法自愈的问题)
+    let (synced, adopted) = crate::trae_instance::sync_credential_from_instance(account, &cred);
+    if synced.expires_at > now_ms() || adopted {
+        persist_credential(state, account, &synced);
+        Ok(synced)
+    } else {
+        mark_credential_expired(state, &account.id);
+        Err(AppError::Credential(
+            "token 已过期，请打开该账号的 TRAE 实例（TRAE 会自动刷新），刷新后重试".into(),
+        ))
+    }
+}
+
+/// 单账号签到(桌面凭据模式):凭据由 get_valid_credential 回读自 TRAE 实例目录,
+/// 应用不主动刷新 token。鉴权失败仅提示,不做网络刷新。
 pub async fn checkin_by_desktop(
     account: &Account,
     client: &reqwest::Client,
     state: &AppState,
 ) -> CheckinResult {
-    let cred = match get_valid_credential(account, client, state).await {
+    let cred = match get_valid_credential(account, state).await {
         Ok(c) => c,
         Err(e) => {
             return CheckinResult {
@@ -106,12 +188,40 @@ pub async fn checkin_by_desktop(
             }
         }
     };
-    let headers = auth_headers(&cred);
+    // 鉴权失败(token 被服务端判失效):应用不刷新,给出指引
+    let (result, auth_failed) = checkin_once(&cred, client).await;
+    if !auth_failed {
+        return result;
+    }
+    mark_credential_expired(state, &account.id);
+    CheckinResult {
+        success: false,
+        message: "签到接口鉴权失败(token 已失效)，请打开该账号的 TRAE 实例让客户端刷新后再试".into(),
+        points: None,
+    }
+}
+
+/// 凭据指纹(诊断用,仅脱敏前 8 位 token,不含完整密钥)
+fn cred_fingerprint(cred: &Credential) -> String {
+    let tok: String = cred.token.chars().take(8).collect();
+    format!(
+        "token={tok}… host={} dev={} uid={} exp={} now={}",
+        cred.host,
+        cred.device_id,
+        cred.user_id,
+        cred.expires_at,
+        now_ms()
+    )
+}
+
+/// 用给定凭据执行一次签到(查询状态 -> 领取)。返回 (结果, 是否疑似鉴权失败)
+async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinResult, bool) {
+    let headers = auth_headers(cred);
     let host = &cred.host;
 
     // 1. 查询签到状态
     let status_url = format!("{}{}", host, STATUS_PATH);
-    let status_resp = match client
+    let resp = match client
         .post(&status_url)
         .headers(headers.clone())
         .json(&json!({}))
@@ -121,51 +231,81 @@ pub async fn checkin_by_desktop(
     {
         Ok(r) => r,
         Err(e) => {
-            return CheckinResult {
-                success: false,
-                message: format!("TRAE 桌面端签到失败: {e}"),
-                points: None,
-            }
+            return (
+                CheckinResult {
+                    success: false,
+                    message: format!("TRAE 桌面端签到失败: {e}"),
+                    points: None,
+                },
+                false,
+            )
         }
     };
-    let status_data: Value = match status_resp.json().await {
+    let http_status = resp.status().as_u16();
+    let status_data: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            return CheckinResult {
-                success: false,
-                message: format!("解析签到状态失败: {e}"),
-                points: None,
-            }
+            return (
+                CheckinResult {
+                    success: false,
+                    message: format!("解析签到状态失败: {e}"),
+                    points: None,
+                },
+                false,
+            )
         }
     };
+    eprintln!(
+        "[checkin] 状态查询 HTTP {} {} 凭据={}",
+        http_status,
+        status_data,
+        cred_fingerprint(cred)
+    );
+
+    if is_auth_failure(http_status, Some(&status_data)) {
+        return (
+            CheckinResult {
+                success: false,
+                message: "签到接口鉴权失败(token 已失效)".into(),
+                points: None,
+            },
+            true,
+        );
+    }
 
     if status_data
         .get("checked_in")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        return CheckinResult {
-            success: true,
-            message: "今日已签到".into(),
-            points: None,
-        };
+        return (
+            CheckinResult {
+                success: true,
+                message: "今日已签到".into(),
+                points: None,
+            },
+            false,
+        );
     }
     if !api_succeeded(&status_data) {
-        return CheckinResult {
-            success: false,
-            message: status_data
-                .get("message")
-                .and_then(|v| v.as_str())
-                .or_else(|| status_data.get("msg").and_then(|v| v.as_str()))
-                .unwrap_or("无法获取 TRAE 签到状态")
-                .to_string(),
-            points: None,
-        };
+        return (
+            CheckinResult {
+                success: false,
+                message: status_data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| status_data.get("msg").and_then(|v| v.as_str()))
+                    .unwrap_or("无法获取 TRAE 签到状态")
+                    .to_string(),
+                points: None,
+            },
+            false,
+        );
     }
 
     // 2. 领取签到
     let claim_url = format!("{}{}", host, CLAIM_PATH);
-    let claim_resp = match client
+    let resp = match client
         .post(&claim_url)
         .headers(headers)
         .json(&json!({}))
@@ -175,23 +315,47 @@ pub async fn checkin_by_desktop(
     {
         Ok(r) => r,
         Err(e) => {
-            return CheckinResult {
-                success: false,
-                message: format!("TRAE 桌面端签到失败: {e}"),
-                points: None,
-            }
+            return (
+                CheckinResult {
+                    success: false,
+                    message: format!("TRAE 桌面端签到失败: {e}"),
+                    points: None,
+                },
+                false,
+            )
         }
     };
-    let claim_data: Value = match claim_resp.json().await {
+    let http_status = resp.status().as_u16();
+    let claim_data: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            return CheckinResult {
-                success: false,
-                message: format!("解析签到结果失败: {e}"),
-                points: None,
-            }
+            return (
+                CheckinResult {
+                    success: false,
+                    message: format!("解析签到结果失败: {e}"),
+                    points: None,
+                },
+                false,
+            )
         }
     };
+    eprintln!(
+        "[checkin] 领取 HTTP {} {} 凭据={}",
+        http_status,
+        claim_data,
+        cred_fingerprint(cred)
+    );
+
+    if is_auth_failure(http_status, Some(&claim_data)) {
+        return (
+            CheckinResult {
+                success: false,
+                message: "签到接口鉴权失败(token 已失效)".into(),
+                points: None,
+            },
+            true,
+        );
+    }
 
     if api_succeeded(&claim_data) {
         let msg = {
@@ -211,22 +375,28 @@ pub async fn checkin_by_desktop(
             .and_then(|v| v.as_i64())
             .or_else(|| claim_data.get("points").and_then(|v| v.as_i64()))
             .or(Some(200));
-        CheckinResult {
-            success: true,
-            message: msg,
-            points,
-        }
+        (
+            CheckinResult {
+                success: true,
+                message: msg,
+                points,
+            },
+            false,
+        )
     } else {
-        CheckinResult {
-            success: false,
-            message: claim_data
-                .get("message")
-                .and_then(|v| v.as_str())
-                .or_else(|| claim_data.get("msg").and_then(|v| v.as_str()))
-                .unwrap_or("签到失败")
-                .to_string(),
-            points: None,
-        }
+        (
+            CheckinResult {
+                success: false,
+                message: claim_data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| claim_data.get("msg").and_then(|v| v.as_str()))
+                    .unwrap_or("签到失败")
+                    .to_string(),
+                points: None,
+            },
+            false,
+        )
     }
 }
 
@@ -340,13 +510,13 @@ fn extract_points_from_data(data: &Value) -> Option<i64> {
     None
 }
 
-/// 查询账号总积分
+/// 查询账号总积分:请求遇鉴权失败时,反应式刷新 token 后重试一次
 pub async fn get_total_points(
     account: &Account,
     client: &reqwest::Client,
     state: &AppState,
 ) -> PointsResult {
-    let cred = match get_valid_credential(account, client, state).await {
+    let cred = match get_valid_credential(account, state).await {
         Ok(c) => c,
         Err(e) => {
             return PointsResult {
@@ -356,7 +526,22 @@ pub async fn get_total_points(
             }
         }
     };
-    let headers = auth_headers(&cred);
+    // 鉴权失败(token 被服务端判失效):应用不刷新,给出指引
+    let (result, auth_failed) = points_once(&cred, client).await;
+    if !auth_failed {
+        return result;
+    }
+    mark_credential_expired(state, &account.id);
+    PointsResult {
+        success: false,
+        message: "积分接口鉴权失败(token 已失效)，请打开该账号的 TRAE 实例让客户端刷新后再试".into(),
+        total_points: None,
+    }
+}
+
+/// 用给定凭据查询一次总积分(遍历余额接口)。返回 (结果, 是否疑似鉴权失败)
+async fn points_once(cred: &Credential, client: &reqwest::Client) -> (PointsResult, bool) {
+    let headers = auth_headers(cred);
     let host = &cred.host;
 
     for path in CREDITS_BALANCE_PATHS {
@@ -394,35 +579,57 @@ pub async fn get_total_points(
                 }
             }
         };
+        let http_status = resp.status().as_u16();
         let data: Value = match resp.json().await {
             Ok(v) => v,
             Err(_) => continue,
         };
 
+        // 鉴权失败:token 已失效,不再遍历剩余接口,交由上层刷新重试
+        if is_auth_failure(http_status, Some(&data)) {
+            return (
+                PointsResult {
+                    success: false,
+                    message: "积分接口鉴权失败(token 已失效)".into(),
+                    total_points: None,
+                },
+                true,
+            );
+        }
+
         if path.contains("user_current_entitlement_list") {
             if let Some(remaining) = extract_trae_remaining_credits(&data) {
-                return PointsResult {
-                    success: true,
-                    message: "获取积分成功".into(),
-                    total_points: Some(remaining),
-                };
+                return (
+                    PointsResult {
+                        success: true,
+                        message: "获取积分成功".into(),
+                        total_points: Some(remaining),
+                    },
+                    false,
+                );
             }
             continue;
         }
         if let Some(points) = extract_points_from_data(&data) {
-            return PointsResult {
-                success: true,
-                message: "获取积分成功".into(),
-                total_points: Some(points),
-            };
+            return (
+                PointsResult {
+                    success: true,
+                    message: "获取积分成功".into(),
+                    total_points: Some(points),
+                },
+                false,
+            );
         }
     }
 
-    PointsResult {
-        success: false,
-        message: "未能获取到积分信息".into(),
-        total_points: None,
-    }
+    (
+        PointsResult {
+            success: false,
+            message: "未能获取到积分信息".into(),
+            total_points: None,
+        },
+        false,
+    )
 }
 
 // ===== 执行签到(含状态更新与日志) =====
@@ -512,6 +719,52 @@ pub async fn perform_all_checkin(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_failure_detection() {
+        // HTTP 401/403 直接判定
+        assert!(is_auth_failure(401, None));
+        assert!(is_auth_failure(403, None));
+        assert!(!is_auth_failure(200, None));
+        // 业务码 401/403
+        assert!(is_auth_failure(200, Some(&json!({ "code": 401 }))));
+        assert!(is_auth_failure(
+            200,
+            Some(&json!({ "code": "403", "message": "ok" }))
+        ));
+        // 消息关键词(token 失效/未登录)
+        assert!(is_auth_failure(
+            200,
+            Some(&json!({ "code": 1001, "message": "token expired" }))
+        ));
+        assert!(is_auth_failure(
+            200,
+            Some(&json!({ "msg": "请先登录" }))
+        ));
+        assert!(is_auth_failure(
+            200,
+            Some(&json!({ "message": "Unauthorized" }))
+        ));
+        // 正常业务响应不误判
+        assert!(!is_auth_failure(
+            200,
+            Some(&json!({ "code": 0, "message": "success" }))
+        ));
+        assert!(!is_auth_failure(
+            200,
+            Some(&json!({ "message": "今日已签到" }))
+        ));
+        // 限频/风控不是凭证问题,不判为鉴权失败
+        assert!(!is_auth_failure(
+            200,
+            Some(&json!({ "message": "操作太过频繁啦，请稍后尝试" }))
+        ));
+    }
 }
 
 #[cfg(test)]

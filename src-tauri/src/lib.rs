@@ -132,7 +132,10 @@ pub fn run() {
                             let _ = app.emit("tray-checkin", ());
                         }
                         "tray_quit" => {
-                            app.exit(0);
+                            // app.exit(0) 经事件循环退出,实测存在退出失效的情况;
+                            // 改为显式清理托盘/窗口资源后强制结束进程,保证退出
+                            app.cleanup_before_exit();
+                            std::process::exit(0);
                         }
                         // 点击账号项:主/工具实例运行则聚焦对应窗口,未运行则启动
                         s if s.starts_with("tray_account_") => {
@@ -259,6 +262,9 @@ pub fn run() {
             commands::get_account_instance_state,
             commands::focus_account_instance,
             commands::open_new_login_instance,
+            commands::scan_instance_dirs,
+            commands::import_account_from_dir,
+            commands::refresh_account_credential,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
