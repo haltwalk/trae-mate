@@ -1,6 +1,7 @@
 // Tauri 应用入口。注册全部命令、通知插件,初始化存储/HTTP/调度器状态,配置系统托盘与关闭到托盘。
 
 mod checkin;
+mod browser_takeover;
 mod commands;
 mod credentials;
 mod error;

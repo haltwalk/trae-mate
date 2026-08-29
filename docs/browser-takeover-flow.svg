@@ -1,0 +1,101 @@
+<svg viewBox="0 0 860 620" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4f6ef7"/>
+    </marker>
+    <marker id="arrowTiny" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a8f98"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="860" height="620" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="20" y="30" font-size="17" font-weight="700" fill="#1f2329">浏览器接管 · 登录隔离 device 流程</text>
+  <text x="20" y="50" font-size="11" fill="#8a8f98">点「个人登录」→ 客户端打开发起的登录 URL → 在被送到浏览器前拦截改写</text>
+
+  <!-- Box A: 客户端弹出登录 -->
+  <g>
+    <rect x="20" y="75" width="230" height="92" fill="#ffffff" stroke="#e3e6ec" stroke-width="1.5" rx="10"/>
+    <rect x="20" y="75" width="230" height="26" fill="#4f6ef7" rx="10" opacity="0.12"/>
+    <text x="135" y="93" font-size="14" font-weight="600" fill="#1f2329" text-anchor="middle">① 客户端弹登录</text>
+    <text x="135" y="120" font-size="12" fill="#8a8f98" text-anchor="middle">生成登录 URL,带</text>
+    <text x="135" y="138" font-size="12" fill="#8a8f98" text-anchor="middle">机器级 device</text>
+    <text x="135" y="156" font-size="12" fill="#8a8f98" text-anchor="middle">(1234567890123456)</text>
+  </g>
+
+  <path d="M250,121 L300,121" fill="none" stroke="#4f6ef7" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Box B: 注册表劫持拦截 -->
+  <g>
+    <rect x="305" y="75" width="230" height="92" fill="#ffffff" stroke="#e3e6ec" stroke-width="1.5" rx="10"/>
+    <rect x="305" y="75" width="230" height="26" fill="#4f6ef7" rx="10" opacity="0.12"/>
+    <text x="420" y="93" font-size="14" font-weight="600" fill="#1f2329" text-anchor="middle">② 注册表重定向拦截</text>
+    <text x="420" y="120" font-size="12" fill="#8a8f98" text-anchor="middle">HKCU http/https 临时指向</text>
+    <text x="420" y="138" font-size="12" fill="#8a8f98" text-anchor="middle">trae-mate --capture-login</text>
+    <text x="420" y="156" font-size="11" fill="#e8930c" text-anchor="middle">等待客户端调用系统浏览器</text>
+  </g>
+
+  <path d="M535,121 L585,121" fill="none" stroke="#4f6ef7" stroke-width="2" marker-end="url(#arrow)"/>
+  <text font-size="11" fill="#8a8f98" x="560" y="112" text-anchor="middle">客户端</text>
+  <text font-size="11" fill="#8a8f98" x="560" y="124" text-anchor="middle">打开URL</text>
+
+  <!-- Box C: 捕获与恢复 -->
+  <g>
+    <rect x="590" y="75" width="250" height="92" fill="#ffffff" stroke="#e3e6ec" stroke-width="1.5" rx="10"/>
+    <rect x="590" y="75" width="250" height="26" fill="#4f6ef7" rx="10" opacity="0.12"/>
+    <text x="715" y="93" font-size="14" font-weight="600" fill="#1f2329" text-anchor="middle">③ 捕获子进程处理</text>
+    <text x="715" y="120" font-size="12" fill="#8a8f98" text-anchor="middle">先恢复浏览器(①备份)</text>
+    <text x="715" y="138" font-size="12" fill="#8a8f98" text-anchor="middle">改写 URL + 同步 storage.json</text>
+    <text x="715" y="156" font-size="11" fill="#25b06a" text-anchor="middle">避免长期占用用户浏览器</text>
+  </g>
+
+  <!-- detail step block -->
+  <g>
+    <rect x="60" y="230" width="360" height="120" fill="#f6f7f9" stroke="#e3e6ec" stroke-width="1.2" rx="10"/>
+    <text x="80" y="255" font-size="14" font-weight="600" fill="#4f6ef7">④ 双层改写 device</text>
+    <text x="80" y="282" font-size="12" fill="#8a8f98">· 顶层 device_id / x_device_id → A</text>
+    <text x="80" y="302" font-size="12" fill="#8a8f98">· redirect_url 内层 device_id → A</text>
+    <text x="80" y="329" font-size="12" fill="#e8930c">生成独立 16 位 device A</text>
+    <text x="80" y="322" font-size="12" fill="#8a8f98">并写入 traemate-login-device.txt</text>
+  </g>
+
+  <g>
+    <rect x="440" y="230" width="400" height="120" fill="#f6f7f9" stroke="#e3e6ec" stroke-width="1.2" rx="10"/>
+    <text x="460" y="255" font-size="14" font-weight="600" fill="#e8930c">⑤ 同步 storage.json → icube-dc = A</text>
+    <text x="460" y="282" font-size="12" fill="#8a8f98">· 迁移签名密钥 Private/PEM</text>
+    <text x="460" y="302" font-size="12" fill="#8a8f98">· 设 has_device_id_updated_to_aha = true</text>
+    <text x="460" y="329" font-size="12" fill="#8a8f98">让「授权设备」=「换 token 设备」</text>
+    <text x="460" y="322" font-size="12" fill="#8a8f98">避免 20403 Token device not match</text>
+  </g>
+
+  <!-- two bottom boxes -->
+  <g>
+    <rect x="60" y="410" width="380" height="90" fill="#ffffff" stroke="#e3e6ec" stroke-width="1.5" rx="10"/>
+    <rect x="60" y="410" width="380" height="26" fill="#4f6ef7" rx="10" opacity="0.12"/>
+    <text x="250" y="428" font-size="14" font-weight="600" fill="#1f2329" text-anchor="middle">⑥ 用原浏览器打开改写后 URL</text>
+    <text x="250" y="458" font-size="12" fill="#8a8f98" text-anchor="middle">用户完成授权,授权设备 = A</text>
+    <text x="250" y="478" font-size="12" fill="#25b06a" text-anchor="middle">客户端换 token 上报 device = A</text>
+  </g>
+
+  <g>
+    <rect x="460" y="410" width="380" height="90" fill="#ffffff" stroke="#e3e6ec" stroke-width="1.5" rx="10"/>
+    <rect x="460" y="410" width="380" height="26" fill="#4f6ef7" rx="10" opacity="0.12"/>
+    <text x="650" y="428" font-size="14" font-weight="600" fill="#1f2329" text-anchor="middle">⑦ 导入账号绑定 checkinDeviceId = A</text>
+    <text x="650" y="458" font-size="12" fill="#8a8f98" text-anchor="middle">TraeMate 读标记文件,用 A 签到</text>
+    <text x="650" y="478" font-size="12" fill="#25b06a" text-anchor="middle">三处统一,不与主账号冲突</text>
+  </g>
+
+  <path d="M250,230 L250,236" fill="none" stroke="#8a8f98" stroke-width="1.5" marker-end="url(#arrowTiny)"/>
+  <path d="M640,230 L640,236" fill="none" stroke="#8a8f98" stroke-width="1.5" marker-end="url(#arrowTiny)"/>
+  <path d="M165,236 L165,350 L250,350 L250,410" fill="none" stroke="#8a8f98" stroke-width="1.5" marker-end="url(#arrowTiny)"/>
+  <path d="M640,236 L640,350 L650,350 L650,410" fill="none" stroke="#8a8f98" stroke-width="1.5" marker-end="url(#arrowTiny)"/>
+
+  <!-- bottom note -->
+  <g>
+    <rect x="60" y="540" width="780" height="60" fill="#f6f7f9" stroke="#e8930c" stroke-width="1.5" rx="8"/>
+    <text x="80" y="565" font-size="13" font-weight="700" fill="#e8930c">核心要点</text>
+    <text x="220" y="565" font-size="12" fill="#8a8f98">授权设备 == 换token设备 == 签到设备(独立A),三环统一 → 登录一次成功、签到不冲突</text>
+    <text x="80" y="588" font-size="12" fill="#8a8f98">· 第一步恢复浏览器解决「窗口一闪而过 / 系统反复唤起 trae-mate」</text>
+  </g>
+</svg>

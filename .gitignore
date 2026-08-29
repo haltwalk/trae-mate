@@ -38,3 +38,7 @@ desktop.ini
 
 # ---- Legacy backup (has its own git repo) ----
 trae-check-orig/
+
+# ---- 运行时产物/本地备份(不进版本库) ----
+backup/
+test_install/
