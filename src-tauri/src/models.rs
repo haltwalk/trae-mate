@@ -33,6 +33,12 @@ pub struct Account {
     /// 多开实例的机器码(每实例独立 UUID,不动系统注册表)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub machine_id: Option<String>,
+    /// 多开实例的签到设备ID(16 位数字 aha 设备ID)。由 TraeMate 持久化,专用于签到
+    /// x-device-id 请求头。不写入客户端 storage.json——客户端手动登录会把设备重置回
+    /// 机器级 ID,若签到依赖改写 storage.json 会与客户端冲突导致要求重新登录。
+    /// 首次生成后稳定复用,即便客户端重置设备也不受影响。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub checkin_device_id: Option<String>,
 }
 
 /// 账号(脱敏,返回前端)。不含加密凭据。
@@ -52,6 +58,8 @@ pub struct PublicAccount {
     pub credential_status: Option<String>,
     pub data_dir: Option<String>,
     pub machine_id: Option<String>,
+    /// 多开实例的签到设备ID(16 位数字 aha 设备ID,由 TraeMate 持久化,见 Account.checkin_device_id)
+    pub checkin_device_id: Option<String>,
 }
 
 impl From<Account> for PublicAccount {
@@ -70,6 +78,7 @@ impl From<Account> for PublicAccount {
             credential_status: a.credential_status,
             data_dir: a.data_dir,
             machine_id: a.machine_id,
+            checkin_device_id: a.checkin_device_id,
         }
     }
 }

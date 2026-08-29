@@ -167,6 +167,17 @@ pub fn get_trae_desktop_credentials() -> AppResult<Credential> {
     read_credentials_from_data_dir(&data_dir)
 }
 
+/// 取 aha 设备ID(`iCubeAuthInfo://icube-dc:*` key 后缀)。
+/// TRAE 客户端迁移 aha 系统后,签到 `x-device-id` 使用该设备ID;旧字段 telemetry.devDeviceId 已废弃。
+/// 缺失(未迁移/无 dc 密钥)时返回 None,由调用方回退。
+fn aha_device_id_from_storage(storage: &Value) -> Option<String> {
+    storage
+        .as_object()?
+        .iter()
+        .find_map(|(k, _)| k.strip_prefix("iCubeAuthInfo://icube-dc:").map(str::to_string))
+        .filter(|s| !s.is_empty())
+}
+
 /// 读取并解密指定 data-dir 的凭据(通用:主目录或独立实例目录均可)
 pub fn read_credentials_from_data_dir(data_dir: &Path) -> AppResult<Credential> {
     let storage_path = data_dir
@@ -188,10 +199,15 @@ pub fn read_credentials_from_data_dir(data_dir: &Path) -> AppResult<Credential> 
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::Credential("TRAE desktop login token is invalid".into()))?;
 
-    let device_id = storage
-        .get("telemetry.devDeviceId")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+    // 签到 x-device-id 用 aha 设备ID(icube-dc key 后缀);旧字段 telemetry.devDeviceId 已废弃,仅回退用
+    let device_id = aha_device_id_from_storage(&storage)
+        .or_else(|| {
+            storage
+                .get("telemetry.devDeviceId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
         .ok_or_else(|| AppError::Credential("TRAE desktop device ID is unavailable".into()))?;
 
     let machine_id = storage
@@ -336,12 +352,15 @@ pub fn read_auth_from_data_dir_loose(
         refresh_token: str_field("refreshToken").unwrap_or_else(|| fallback.refresh_token.clone()),
         expires_at,
         refresh_expires_at,
-        // telemetry 可能在工具目录中缺失/为多开占位值,统一兜底快照
-        device_id: storage
-            .get("telemetry.devDeviceId")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+        // 签到 x-device-id 用实例自身 aha 设备ID(icube-dc key 后缀);telemetry 可能是多开占位/缺失,兜底快照
+        device_id: aha_device_id_from_storage(&storage)
+            .or_else(|| {
+                storage
+                    .get("telemetry.devDeviceId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| fallback.device_id.clone()),
         machine_id: storage
             .get("telemetry.machineId")
@@ -372,6 +391,22 @@ pub fn read_auth_from_data_dir_loose(
             .or_else(|| fallback.avatar_url.clone()),
         region,
     })
+}
+
+/// 读取主目录实例的 aha 设备ID(icube-dc key 后缀),用于判断工具实例是否与主目录共用设备。
+/// 服务端按设备维度做签到限额,共用同一设备 ID 会互相冲突(code 9074)。
+/// 失败(主目录未登录/未迁移)返回 None。
+/// 设备ID模型与「覆盖红线」的完整说明见 trae_instance.rs 顶部模块注释。
+pub fn read_main_aha_device_id() -> Option<String> {
+    let appdata = env::var("APPDATA").ok()?;
+    let storage_path = PathBuf::from(&appdata)
+        .join("TRAE SOLO CN")
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let raw = fs::read_to_string(&storage_path).ok()?;
+    let storage: Value = serde_json::from_str(&raw).ok()?;
+    aha_device_id_from_storage(&storage)
 }
 
 /// 读取主目录实例的 telemetry.devDeviceId(用于识别工具目录是否被污染为与主目录共用设备)。

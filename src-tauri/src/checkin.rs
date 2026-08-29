@@ -105,6 +105,11 @@ async fn get_valid_credential(
     account: &Account,
     state: &AppState,
 ) -> AppResult<Credential> {
+    // 多开实例签到设备隔离:签到设备ID由 TraeMate 独立持有并持久化(get_or_create_checkin_device_id),
+    // 只用在 x-device-id 请求头,绝不改写客户端 storage.json。客户端手动登录会把设备重置回
+    // 机器级 ID(与主账号共用会触发服务端设备维限额 code 9074),若靠改写 storage.json 注入
+    // 独立设备会让客户端检测到设备变化而强制要求重新登录。主账号返回 None,沿用回读设备。
+    let isolated_device = crate::trae_instance::get_or_create_checkin_device_id(account, state);
     let encrypted = account
         .encrypted_credential
         .as_ref()
@@ -117,6 +122,12 @@ async fn get_valid_credential(
     if synced.expires_at > now || adopted {
         persist_credential(state, account, &synced);
         cred = synced;
+    }
+    // 多开实例:签到设备ID一律用实例隔离后的设备——快照/回读可能残留被重置的机器级 ID,
+    // 即使 token 走快照,设备也必须是指定的独立设备,否则与主账号共用触发设备维限额。
+    // 主账号(无独立 data-dir)返回 None,保持原设备不动。
+    if let Some(dev) = isolated_device {
+        cred.device_id = dev;
     }
     if cred.expires_at <= now {
         mark_credential_expired(state, &account.id);
@@ -774,7 +785,238 @@ mod e2e_tests {
     use crate::models::Account;
     use crate::store::{AppState, StoreData};
     use crate::trae_auth::get_trae_desktop_credentials;
+    use rand::Rng;
     use std::sync::Mutex;
+
+    /// 直连 claim:跳过 status 预检,直接 POST claim 接口,打印服务端原始返回。
+    /// 用于验证"今天已签过"时 claim 是否接受真实桌面设备(而非提前 return 走不到 claim)。
+    #[tokio::test]
+    async fn e2e_direct_claim() {
+        let cred = match get_trae_desktop_credentials() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[e2e-direct-claim] 未读取到 TRAE 桌面凭据: {e}");
+                return;
+            }
+        };
+        eprintln!(
+            "[e2e-direct-claim] 凭据: host={} dev={} uid={} exp={}",
+            cred.host, cred.device_id, cred.user_id, cred.expires_at
+        );
+        let client = reqwest::Client::new();
+        let claim_url = format!("{}{}", cred.host, CLAIM_PATH);
+        let resp = client
+            .post(&claim_url)
+            .headers(auth_headers(&cred))
+            .json(&json!({}))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let http_status = r.status().as_u16();
+                let body: Value = r.json().await.unwrap_or(json!({}));
+                eprintln!("[e2e-direct-claim] HTTP {http_status} body={body}");
+            }
+            Err(e) => {
+                eprintln!("[e2e-direct-claim] 请求失败: {e}");
+            }
+        }
+    }
+
+    /// 直连 claim:走正常读取路径(get_trae_desktop_credentials),验证签到使用的是 aha 设备ID
+    /// (icube-dc key 后缀)而非废弃的 telemetry.devDeviceId。
+    #[tokio::test]
+    async fn e2e_direct_claim_aha_device() {
+        let cred = match get_trae_desktop_credentials() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[e2e-aha] 未读取到 TRAE 桌面凭据: {e}");
+                return;
+            }
+        };
+        eprintln!(
+            "[e2e-aha] 凭据读取的设备ID: {} (应为 icube-dc 后缀,非 bcda0361...) uid={}",
+            cred.device_id, cred.user_id
+        );
+        let client = reqwest::Client::new();
+        let claim_url = format!("{}{}", cred.host, CLAIM_PATH);
+        let resp = client
+            .post(&claim_url)
+            .headers(auth_headers(&cred))
+            .json(&json!({}))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let http_status = r.status().as_u16();
+                let body: Value = r.json().await.unwrap_or(json!({}));
+                eprintln!("[e2e-aha] HTTP {http_status} body={body}");
+            }
+            Err(e) => {
+                eprintln!("[e2e-aha] 请求失败: {e}");
+            }
+        }
+    }
+
+    /// 扫描多开实例目录的账号身份与当前 aha 设备ID(icube-dc 后缀),判断设备隔离现状。
+    /// 仅打印脱敏信息,不发网络请求。
+    #[test]
+    fn e2e_inspect_instance_device_ids() {
+        let Ok(appdata) = std::env::var("APPDATA") else {
+            return;
+        };
+        let dirs = [
+            format!("{appdata}\\TRAE SOLO CN_YOUR_ACCOUNT_1"),
+            format!("{appdata}\\TRAE SOLO CN_YOUR_ACCOUNT_2"),
+        ];
+        for d in dirs {
+            let path = std::path::Path::new(&d);
+            match crate::trae_auth::read_auth_from_data_dir_loose(
+                path,
+                &crate::models::Credential::empty(),
+            ) {
+                Ok(c) => eprintln!(
+                    "[inspect] dir={} account={} uid={} device_id={} host={}",
+                    d, c.account_name, c.user_id, c.device_id, c.host
+                ),
+                Err(e) => eprintln!("[inspect] dir={} 读取失败: {e}", d),
+            }
+        }
+    }
+
+    /// 关键验证:用多开实例账号(账号02)的 token + 伪造的独立 aha 设备ID直连 claim,
+    /// 判断服务端是否接受"注入的"设备ID——决定多开实例能否靠改写设备ID实现隔离。
+    #[tokio::test]
+    async fn e2e_claim_fabricated_device_instance() {
+        let Ok(appdata) = std::env::var("APPDATA") else {
+            return;
+        };
+        let dir = format!("{appdata}\\TRAE SOLO CN_YOUR_ACCOUNT_1");
+        let cred = match crate::trae_auth::read_auth_from_data_dir_loose(
+            std::path::Path::new(&dir),
+            &crate::models::Credential::empty(),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[e2e-fake] 读取实例凭据失败: {e}");
+                return;
+            }
+        };
+        let mut rng = rand::thread_rng();
+        let fake: u64 = rng.gen_range(1_000_000_000_000_000_u64..9_999_999_999_999_999_u64);
+        let mut fake_cred = cred.clone();
+        fake_cred.device_id = fake.to_string();
+        eprintln!(
+            "[e2e-fake] account={} uid={} 原设备={} -> 伪造设备={}",
+            cred.account_name, cred.user_id, cred.device_id, fake_cred.device_id
+        );
+        let client = reqwest::Client::new();
+        let claim_url = format!("{}{}", fake_cred.host, CLAIM_PATH);
+        let resp = client
+            .post(&claim_url)
+            .headers(auth_headers(&fake_cred))
+            .json(&json!({}))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let http_status = r.status().as_u16();
+                let body: Value = r.json().await.unwrap_or(json!({}));
+                eprintln!("[e2e-fake] HTTP {http_status} body={body}");
+            }
+            Err(e) => eprintln!("[e2e-fake] 请求失败: {e}"),
+        }
+    }
+
+    /// 账号03 签到验证:用多开实例账号(账号03,目录 YOUR_ACCOUNT_2)的 token +
+    /// 新随机伪造的设备ID直连 claim。账号03 今日未签到,验证伪造设备能否为其完成签到。
+    /// 只读目录凭据,不落盘、不碰账号03 原本存储的设备。
+    #[tokio::test]
+    async fn e2e_claim_fabricated_micro03() {
+        let Ok(appdata) = std::env::var("APPDATA") else {
+            return;
+        };
+        let dir = format!("{appdata}\\TRAE SOLO CN_YOUR_ACCOUNT_2");
+        let cred = match crate::trae_auth::read_auth_from_data_dir_loose(
+            std::path::Path::new(&dir),
+            &crate::models::Credential::empty(),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[e2e-micro03] 读取实例凭据失败: {e}");
+                return;
+            }
+        };
+        let mut rng = rand::thread_rng();
+        let fake: u64 = rng.gen_range(1_000_000_000_000_000_u64..9_999_999_999_999_999_u64);
+        let mut fake_cred = cred.clone();
+        fake_cred.device_id = fake.to_string();
+        eprintln!(
+            "[e2e-micro03] account={} uid={} 原设备={} -> 新伪造设备={}",
+            cred.account_name, cred.user_id, cred.device_id, fake_cred.device_id
+        );
+        let client = reqwest::Client::new();
+        let claim_url = format!("{}{}", fake_cred.host, CLAIM_PATH);
+        let resp = client
+            .post(&claim_url)
+            .headers(auth_headers(&fake_cred))
+            .json(&json!({}))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let http_status = r.status().as_u16();
+                let body: Value = r.json().await.unwrap_or(json!({}));
+                eprintln!("[e2e-micro03] HTTP {http_status} body={body}");
+            }
+            Err(e) => eprintln!("[e2e-micro03] 请求失败: {e}"),
+        }
+    }
+
+    /// 对照实验:用多开实例账号(账号02)的 token + 其自身当前设备ID直连 claim。
+    /// 区分 9074 是"伪造设备被拒"还是"当日总配额已满"。
+    #[tokio::test]
+    async fn e2e_claim_instance_original_device() {
+        let Ok(appdata) = std::env::var("APPDATA") else {
+            return;
+        };
+        let dir = format!("{appdata}\\TRAE SOLO CN_YOUR_ACCOUNT_1");
+        let cred = match crate::trae_auth::read_auth_from_data_dir_loose(
+            std::path::Path::new(&dir),
+            &crate::models::Credential::empty(),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[e2e-orig] 读取实例凭据失败: {e}");
+                return;
+            }
+        };
+        eprintln!(
+            "[e2e-orig] account={} uid={} 设备ID={} (实例自身设备,未注入)",
+            cred.account_name, cred.user_id, cred.device_id
+        );
+        let client = reqwest::Client::new();
+        let claim_url = format!("{}{}", cred.host, CLAIM_PATH);
+        let resp = client
+            .post(&claim_url)
+            .headers(auth_headers(&cred))
+            .json(&json!({}))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let http_status = r.status().as_u16();
+                let body: Value = r.json().await.unwrap_or(json!({}));
+                eprintln!("[e2e-orig] HTTP {http_status} body={body}");
+            }
+            Err(e) => eprintln!("[e2e-orig] 请求失败: {e}"),
+        }
+    }
 
     /// 端到端:读取桌面凭据 -> DPAPI 加密 -> perform_checkin 真实签到。
     /// 今日已签到则返回"今日已签到"(无副作用);未签到则执行 claim。
@@ -803,6 +1045,7 @@ mod e2e_tests {
             credential_status: None,
             data_dir: None,
             machine_id: None,
+            checkin_device_id: None,
         };
         let state = AppState {
             data: Mutex::new(StoreData {

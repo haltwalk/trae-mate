@@ -20,10 +20,19 @@ use crate::trae_machine;
 #[tauri::command]
 pub fn get_accounts(state: State<'_, AppState>) -> Vec<PublicAccount> {
     let data = state.data.lock().unwrap();
+    let main_dev = trae_auth::read_main_aha_device_id();
     data.get_accounts()
         .iter()
         .cloned()
         .map(PublicAccount::from)
+        // 主账号无独立 data-dir(用主目录机器码签到),展示层用主机器码填充 checkin_device_id,
+        // 让前端也能显示 16 位设备码;多开账号保持自身独立签到设备不变。
+        .map(|mut a| {
+            if a.data_dir.is_none() {
+                a.checkin_device_id = main_dev.clone();
+            }
+            a
+        })
         .collect()
 }
 
@@ -49,6 +58,7 @@ pub fn import_desktop_account(state: State<'_, AppState>) -> AppResult<PublicAcc
         credential_status: Some(status.to_string()),
         data_dir: None,
         machine_id: None,
+        checkin_device_id: None,
     };
     let mut data = state.data.lock().unwrap();
     let saved = data.upsert_desktop_account(account);
@@ -420,6 +430,8 @@ pub fn focus_account_instance(id: String, state: State<'_, AppState>) -> AppResu
 
 /// 打开新的空白 TRAE 实例供用户登录,后台轮询登录完成后自动导入账号:
 /// 检测登录 -> 读凭据 -> 杀实例 -> 改名临时目录为标准 TRAE SOLO CN_{userId} -> upsert 账号绑定 -> emit 事件。
+/// 免劫持:客户端正常登录(机器码),签到时由 get_or_create_checkin_device_id 检测目录设备
+/// 与主账号机器码相同而改用独立签到设备,保证多账号设备隔离。
 #[tauri::command]
 pub fn open_new_login_instance(app: AppHandle) -> AppResult<()> {
     let appdata = std::env::var("APPDATA")
@@ -443,6 +455,9 @@ pub fn open_new_login_instance(app: AppHandle) -> AppResult<()> {
         .join(trae_instance::SHARED_EXTENSIONS_DIR)
         .to_string_lossy()
         .to_string();
+
+    // 启动前注入独立 machineid/telemetry(仅独立身份,不注入 icube-dc 设备,客户端登录时自行注册)。
+    let _injected_dev = trae_instance::prepare_new_login_dir(&temp_dir);
 
     // 启动空白实例(不写凭据,用户自行登录)
     trae_machine::open_product_with_data_dir(&exe_path, &temp_dir, Some(&shared_ext))?;
@@ -543,6 +558,9 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
     };
     let now = now_ms();
     let status = credential_status(cred.expires_at, now);
+    // 免劫持方案:签到设备隔离不在此绑定。checkin_device_id 初始为 None,
+    // 首次签到时由 get_or_create_checkin_device_id 检测目录设备与主账号机器码相同
+    // 而自动生成并持久化独立签到设备(与主账号机器级隔离),避免因共用机器码撞车。
     let account = Account {
         id: generate_id(),
         name: cred.account_name.clone(),
@@ -558,6 +576,7 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
         credential_status: Some(status.to_string()),
         data_dir: Some(target_dir.to_string_lossy().to_string()),
         machine_id: Some(cred.machine_id.clone()),
+        checkin_device_id: None,
     };
     {
         let state = app.state::<AppState>();
@@ -682,6 +701,7 @@ pub fn import_account_from_dir(
                 credential_status: Some(status.to_string()),
                 data_dir: Some(data_dir.clone()),
                 machine_id,
+                checkin_device_id: None,
             };
             data.upsert_desktop_account(account)
         }
