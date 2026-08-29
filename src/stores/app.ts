@@ -16,6 +16,8 @@ export interface Account {
   credentialStatus?: 'valid' | 'expiring' | 'expired'
   dataDir?: string
   machineId?: string
+  /** 多开实例的签到设备ID(16 位数字 aha 设备ID,首次签到后由 TraeMate 持久化) */
+  checkinDeviceId?: string
 }
 
 export interface CheckinLog {
@@ -252,6 +254,8 @@ export const useAppStore = defineStore('app', () => {
 
   // 打开新的空白 TRAE 实例供用户登录(登录后后端自动导入账号并 emit login-imported 事件)
   // waitingLogin 标记等待状态,供界面显示持续提示;login-imported 事件回调中复位
+  // 免劫持:客户端正常登录(机器码),签到设备隔离由后端 get_or_create_checkin_device_id
+  // 检测机器码相同而改用独立设备自动兜底。
   async function openNewLoginInstance() {
     waitingLogin.value = true
     try {

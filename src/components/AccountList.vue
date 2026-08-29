@@ -80,9 +80,7 @@ async function handleToggle(id: string, enabled: boolean) {
 }
 
 async function handleDelete(id: string) {
-  if (confirm('确定要删除这个账号吗？此操作不可恢复。')) {
-    await store.deleteAccount(id)
-  }
+  await store.deleteAccount(id)
 }
 
 function handleEdit(id: string, newName?: string) {

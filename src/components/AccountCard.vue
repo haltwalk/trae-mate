@@ -50,6 +50,20 @@
           </button>
         </span>
       </div>
+      <!-- 多开实例:展示签到设备码(虚拟设备码标签在左,数字在右) -->
+      <div class="info-row" v-if="account.dataDir">
+        <span class="info-label">虚拟设备码</span>
+        <span class="dev-value" title="本账号专属的隔离设备,签到用它与真实设备码隔离">
+          <span class="dev-value__num">{{ account.checkinDeviceId || '首次签到后生成' }}</span>
+        </span>
+      </div>
+      <!-- 主账号:无独立 data-dir,展示真实设备码(标签在左,数字在右) -->
+      <div class="info-row" v-else>
+        <span class="info-label">真实设备码</span>
+        <span class="dev-value" title="本机真实设备码,所有账号默认共用的那个">
+          <span class="dev-value__num">{{ account.checkinDeviceId || '主账号·真实设备码' }}</span>
+        </span>
+      </div>
     </div>
 
     <!-- 卡片底部 -->
@@ -83,9 +97,22 @@
       <button type="button" class="btn btn-sm btn-outline" @click.stop="startEdit">
         编辑
       </button>
-      <button class="btn btn-sm btn-outline danger" @click="handleDelete">
+      <button class="btn btn-sm btn-outline danger" @click="showDeleteConfirm = true">
         删除
       </button>
+    </div>
+  </div>
+  <!-- 删除确认弹窗 -->
+  <div v-if="showDeleteConfirm" class="delete-overlay" @click.self="showDeleteConfirm = false">
+    <div class="delete-dialog">
+      <h3>删除实例</h3>
+      <p class="delete-warning">
+        确定要删除「{{ account.name }}」吗？此操作将删除该账号及其多开实例数据，不可恢复。
+      </p>
+      <div class="delete-actions">
+        <button class="btn btn-sm btn-outline" @click="showDeleteConfirm = false">取消</button>
+        <button class="btn btn-sm btn-outline danger" @click="confirmDelete">确认删除</button>
+      </div>
     </div>
   </div>
   <div v-if="editing" class="edit-overlay" @click.self="cancelEdit">
@@ -210,7 +237,10 @@ async function handleFocus() {
   }
 }
 
-function handleDelete() {
+const showDeleteConfirm = ref(false)
+
+function confirmDelete() {
+  showDeleteConfirm.value = false
   emit('delete', props.account.id)
 }
 
@@ -365,10 +395,29 @@ function formatDateTime(timestamp: number): string {
   white-space: nowrap;
 }
 
+/* 签到设备码数字:右侧值,限制宽度避免溢出 */
+.dev-value {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.dev-value__num {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .info-value.points {
   color: var(--warning);
   font-weight: 700;
 }
+
+/* 设备码数值:与其它信息行一致,不加额外颜色 */
 
 /* 桌面凭证行:状态 + 手动刷新小按钮 */
 .cred-value-wrap {
@@ -482,6 +531,47 @@ function formatDateTime(timestamp: number): string {
 }
 
 .edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* 删除确认弹窗 - 复用编辑弹窗的浮层风格,提示色用危险色 */
+.delete-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.35);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.delete-dialog {
+  width: 360px;
+  padding: 22px;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  border: none;
+  box-shadow: var(--shadow-bold-raised);
+}
+
+.delete-dialog h3 {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.delete-warning {
+  margin: 16px 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.delete-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;

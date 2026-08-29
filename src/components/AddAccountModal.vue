@@ -25,6 +25,8 @@
           </div>
         </div>
 
+        <!-- 新增实例前置提示:免劫持后无需再要求关闭所有 TRAE,此处已移除 -->
+
         <div class="form-group">
           <label class="form-checkbox">
             <input type="checkbox" v-model="form.enabled" checked />
@@ -62,14 +64,18 @@
 
       <div class="modal-footer">
         <div class="footer-row">
-          <button class="btn btn-outline" @click="scanDirs" :disabled="scanning">
-            <span v-if="scanning" class="spinner"></span>
-            <span>{{ scanning ? '扫描中...' : '扫描已有多开目录' }}</span>
-          </button>
-          <button class="btn btn-outline" @click="openNewLoginInstance" :disabled="submitting">
-            打开新实例登录
-          </button>
-        </div>
+        <button class="btn btn-outline" @click="scanDirs" :disabled="scanning">
+          <span v-if="scanning" class="spinner"></span>
+          <span>{{ scanning ? '扫描中...' : '扫描已有多开目录' }}</span>
+        </button>
+        <button
+          class="btn btn-outline"
+          @click="openNewLoginInstance"
+          :disabled="submitting"
+        >
+          打开新实例登录
+        </button>
+      </div>
         <div class="footer-row">
           <button class="btn btn-secondary" @click="handleClose">取消</button>
           <button class="btn btn-primary" @click="importDesktopAccount" :disabled="submitting">
@@ -132,6 +138,7 @@ async function importDesktopAccount() {
 async function openNewLoginInstance() {
   emit('update:visible', false)
   try {
+    // 免劫持登录,签到设备隔离由后端自动生成独立设备兜底
     await store.openNewLoginInstance()
   } catch (e: any) {
     emit('notify', '打开实例失败: ' + (e?.message || e), 'error')
