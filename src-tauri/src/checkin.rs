@@ -7,12 +7,16 @@ use serde_json::{json, Value};
 use crate::credentials::{decrypt_credential, encrypt_credential};
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    credential_status, Account, CheckinLog, CheckinResult, Credential, PointsResult, PublicAccount,
+    credential_status, Account, CheckinLog, CheckinResult, Credential, EntitlementDetail,
+    PointsResult, PublicAccount,
 };
 use crate::store::{generate_id, AppState};
 
 const STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
 const CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
+
+/// 今日已签到时的消息文案,也是日志三态判定的依据
+pub const ALREADY_CHECKED_IN: &str = "今日已签到";
 const CREDITS_BALANCE_PATHS: &[&str] = &[
     "/trae/api/v2/pay/user_current_entitlement_list",
     "/trae/api/v2/ug/credits/balance",
@@ -292,7 +296,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
         return (
             CheckinResult {
                 success: true,
-                message: "今日已签到".into(),
+                message: ALREADY_CHECKED_IN.into(),
                 points: None,
             },
             false,
@@ -450,36 +454,66 @@ fn find_all_numbers(obj: &Value, prefix: &str) -> Vec<(String, i64)> {
     out
 }
 
-fn extract_trae_remaining_credits(data: &Value) -> Option<i64> {
-    let packs = data.get("user_entitlement_pack_list")?.as_array()?;
-    if packs.is_empty() {
-        return None;
-    }
-    let mut remaining: i64 = 0;
-    let mut found = false;
+// 从 user_current_entitlement_list 提取各类型可用余额明细
+fn extract_entitlement_details(data: &Value) -> Vec<EntitlementDetail> {
+    let mut out = Vec::new();
+    let Some(packs) = data.get("user_entitlement_pack_list").and_then(|v| v.as_array()) else {
+        return out;
+    };
     for pack in packs {
-        let limit = pack
-            .get("entitlement_base_info")
+        let base = pack.get("entitlement_base_info");
+        let limit = base
             .and_then(|b| b.get("quota"))
             .and_then(|q| q.get("credits_limit"))
-            .and_then(|v| v.as_i64());
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if limit <= 0 {
+            continue;
+        }
         let used = pack
             .get("usage")
             .and_then(|u| u.get("credits_amount"))
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        if let Some(limit) = limit {
-            if limit > 0 {
-                found = true;
-                remaining += (limit - used).max(0);
-            }
+        let remaining = (limit - used).max(0);
+        // 剩余 0 的权益包对"可用余额"无意义,直接丢弃,避免前端一堆 0 分噪音
+        if remaining <= 0 {
+            continue;
         }
+        let name = pack
+            .get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| base.and_then(|b| b.get("name")).and_then(|v| v.as_str()))
+            .unwrap_or("积分")
+            .to_string();
+        let expire_at = pack
+            .get("effective_to")
+            .and_then(|v| v.as_i64())
+            .or_else(|| pack.get("expire_time").and_then(|v| v.as_i64()))
+            .or_else(|| base.and_then(|b| b.get("expire_time")).and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        out.push(EntitlementDetail {
+            name,
+            total: limit,
+            remaining,
+            expire_at,
+        });
     }
-    if found {
-        Some(remaining)
-    } else {
-        None
+    out
+}
+
+fn extract_usage_summary_points(data: &Value) -> Option<i64> {
+    let summary = data.get("usage_summary")?;
+    let total = summary.get("total_amount")?.as_f64()?;
+    let consumed = summary
+        .get("consumed_amount")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let available = total - consumed;
+    if available <= 0.0 {
+        return None;
     }
+    Some(available.round() as i64)
 }
 
 fn extract_points_from_data(data: &Value) -> Option<i64> {
@@ -534,6 +568,8 @@ pub async fn get_total_points(
                 success: false,
                 message: e.to_string(),
                 total_points: None,
+                details: vec![],
+                points_response: None,
             }
         }
     };
@@ -547,7 +583,28 @@ pub async fn get_total_points(
         success: false,
         message: "积分接口鉴权失败(token 已失效)，请打开该账号的 TRAE 实例让客户端刷新后再试".into(),
         total_points: None,
+        details: vec![],
+        points_response: None,
     }
+}
+
+/// 将积分查询结果转成可写入账号的字段(json),供持久化
+pub fn points_update_json(result: &PointsResult) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(tp) = result.total_points {
+        m.insert("points".into(), serde_json::json!(tp));
+        m.insert("pointsUpdatedAt".into(), serde_json::json!(now_ms()));
+    }
+    if !result.details.is_empty() {
+        m.insert(
+            "pointsDetails".into(),
+            serde_json::to_value(&result.details).unwrap_or_default(),
+        );
+    }
+    if let Some(resp) = &result.points_response {
+        m.insert("pointsResponse".into(), serde_json::json!(resp));
+    }
+    serde_json::Value::Object(m)
 }
 
 /// 用给定凭据查询一次总积分(遍历余额接口)。返回 (结果, 是否疑似鉴权失败)
@@ -603,18 +660,37 @@ async fn points_once(cred: &Credential, client: &reqwest::Client) -> (PointsResu
                     success: false,
                     message: "积分接口鉴权失败(token 已失效)".into(),
                     total_points: None,
+                    details: vec![],
+                    points_response: None,
                 },
                 true,
             );
         }
 
         if path.contains("user_current_entitlement_list") {
-            if let Some(remaining) = extract_trae_remaining_credits(&data) {
+            let details = extract_entitlement_details(&data);
+            // 优先用 usage_summary 的精确可用积分(total - consumed)
+            if let Some(points) = extract_usage_summary_points(&data) {
                 return (
                     PointsResult {
                         success: true,
                         message: "获取积分成功".into(),
-                        total_points: Some(remaining),
+                        total_points: Some(points),
+                        details,
+                        points_response: Some(data.to_string()),
+                    },
+                    false,
+                );
+            }
+            if !details.is_empty() {
+                let total = details.iter().map(|d| d.remaining).sum();
+                return (
+                    PointsResult {
+                        success: true,
+                        message: "获取积分成功".into(),
+                        total_points: Some(total),
+                        details,
+                        points_response: Some(data.to_string()),
                     },
                     false,
                 );
@@ -627,6 +703,8 @@ async fn points_once(cred: &Credential, client: &reqwest::Client) -> (PointsResu
                     success: true,
                     message: "获取积分成功".into(),
                     total_points: Some(points),
+                    details: vec![],
+                    points_response: None,
                 },
                 false,
             );
@@ -638,6 +716,8 @@ async fn points_once(cred: &Credential, client: &reqwest::Client) -> (PointsResu
             success: false,
             message: "未能获取到积分信息".into(),
             total_points: None,
+            details: vec![],
+            points_response: None,
         },
         false,
     )
@@ -658,12 +738,20 @@ pub async fn perform_checkin(
         (Some(gained), None) => Some(gained),
         (None, base) => base,
     };
+    // 三态:成功签到 / 今日已签到 / 失败
+    let status = if result.success && result.message == ALREADY_CHECKED_IN {
+        "already"
+    } else if result.success {
+        "success"
+    } else {
+        "failed"
+    };
     let mut data = state.data.lock().unwrap();
     data.update_account(
         &account.id,
         json!({
             "lastCheckinAt": now,
-            "lastCheckinResult": if result.success { "success" } else { "failed" },
+            "lastCheckinResult": status,
             "lastCheckinMessage": result.message,
             "points": new_points,
         }),
@@ -673,9 +761,10 @@ pub async fn perform_checkin(
         account_id: account.id.clone(),
         account_name: account.name.clone(),
         time: now,
-        result: if result.success { "success".into() } else { "failed".into() },
+        result: status.into(),
         message: result.message.clone(),
         points_gained: result.points,
+        points_balance: new_points,
     });
     let _ = data.save(&state.path);
     drop(data);
@@ -687,6 +776,15 @@ pub async fn perform_checkin(
 pub async fn perform_all_checkin(
     client: &reqwest::Client,
     state: &AppState,
+) -> Vec<(PublicAccount, CheckinResult)> {
+    run_all_checkin(client, state, None).await
+}
+
+/// 并行错峰签到核心。
+pub(crate) async fn run_all_checkin(
+    client: &reqwest::Client,
+    state: &AppState,
+    tx: Option<tokio::sync::mpsc::Sender<(PublicAccount, CheckinResult)>>,
 ) -> Vec<(PublicAccount, CheckinResult)> {
     let (accounts, retry_count, retry_delay) = {
         let data = state.data.lock().unwrap();
@@ -700,36 +798,42 @@ pub async fn perform_all_checkin(
         (accs, s.retry_count, s.retry_delay)
     };
 
-    let mut results = Vec::new();
-    for account in accounts {
-        let mut last_err = String::new();
-        let mut success = false;
-        for i in 0..=retry_count {
-            let r = perform_checkin(&account, client, state).await;
-            if r.success {
-                results.push((account.clone().into(), r));
-                success = true;
-                break;
+    // 每个账号错峰启动 500ms,既并行提速又降低同时打点触发限频的概率
+    const STAGGER_MS: u64 = 500;
+    let tasks = accounts.into_iter().enumerate().map(|(i, account)| {
+        let tx = tx.clone();
+        async move {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(STAGGER_MS * i as u64)).await;
             }
-            last_err = r.message;
-            if i < retry_count {
-                tokio::time::sleep(Duration::from_secs(retry_delay as u64)).await;
+            let mut last_err = String::new();
+            let mut result = None;
+            for attempt in 0..=retry_count {
+                let r = perform_checkin(&account, client, state).await;
+                if r.success {
+                    result = Some(r);
+                    break;
+                }
+                last_err = r.message;
+                if attempt < retry_count {
+                    tokio::time::sleep(Duration::from_secs(retry_delay as u64)).await;
+                }
             }
-        }
-        if !success {
-            results.push((
-                account.clone().into(),
-                CheckinResult {
+            let r = match result {
+                Some(r) => r,
+                None => CheckinResult {
                     success: false,
                     message: last_err,
                     points: None,
                 },
-            ));
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send((account.clone().into(), r.clone())).await;
+            }
+            (account.into(), r)
         }
-        // 账号之间间隔 2s
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    results
+    });
+    futures::future::join_all(tasks).await
 }
 
 #[cfg(test)]
@@ -1039,6 +1143,9 @@ mod e2e_tests {
             last_checkin_result: None,
             last_checkin_message: None,
             points: None,
+            points_updated_at: None,
+            points_details: vec![],
+            points_response: None,
             enabled: true,
             desktop_user_id: Some(cred.user_id.clone()),
             encrypted_credential: Some(encrypted),

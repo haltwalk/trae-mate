@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 export interface Account {
   id: string
@@ -8,9 +9,15 @@ export interface Account {
   cookie: string
   createdAt: number
   lastCheckinAt?: number
-  lastCheckinResult?: 'success' | 'failed' | 'pending'
+  lastCheckinResult?: 'success' | 'already' | 'failed' | 'pending'
   lastCheckinMessage?: string
   points?: number
+  /** 总积分最近一次真实刷新时间(毫秒) */
+  pointsUpdatedAt?: number
+  /** 各类型可用积分余额明细(来源 user_current_entitlement_list) */
+  pointsDetails?: PointsDetail[]
+  /** user_current_entitlement_list 的原始出参(JSON 字符串) */
+  pointsResponse?: string
   enabled: boolean
   desktopUserId?: string
   credentialStatus?: 'valid' | 'expiring' | 'expired'
@@ -25,9 +32,11 @@ export interface CheckinLog {
   accountId: string
   accountName: string
   time: number
-  result: 'success' | 'failed'
+  result: 'success' | 'already' | 'failed'
   message: string
   pointsGained?: number
+  /** 本次签到时的可用积分余额(签到后) */
+  pointsBalance?: number
 }
 
 export interface CheckinResult {
@@ -40,6 +49,19 @@ export interface PointsResult {
   success: boolean
   message: string
   totalPoints?: number
+  details?: PointsDetail[]
+}
+
+/** 单类积分权益的可用余额 */
+export interface PointsDetail {
+  /** 权益名称/类型,如 "签到奖励" */
+  name: string
+  /** 总配额 */
+  total: number
+  /** 剩余可用 */
+  remaining: number
+  /** 到期时间(毫秒),未知时 0 */
+  expireAt: number
 }
 
 export interface LaunchResult {
@@ -103,7 +125,9 @@ export const useAppStore = defineStore('app', () => {
     const today = new Date().toDateString()
     return accounts.value.filter(a => {
       if (!a.lastCheckinAt) return false
-      return new Date(a.lastCheckinAt).toDateString() === today && a.lastCheckinResult === 'success'
+      // 'success' 本次签到成功;'already' 今日已签到(先前已成功签到,本次无需再签)
+      const ok = a.lastCheckinResult === 'success' || a.lastCheckinResult === 'already'
+      return ok && new Date(a.lastCheckinAt).toDateString() === today
     }).length
   })
 
@@ -144,6 +168,17 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  // 保存账号卡片的展示顺序(拖拽排序后调用)
+  async function reorderAccounts(order: string[]) {
+    try {
+      await invoke('reorder_accounts', { order })
+      await fetchAccounts()
+    } catch (e) {
+      console.error('保存账号顺序失败:', e)
+      throw e
+    }
+  }
+
   // 在途签到的账号 id(防连点重复请求触发服务端限频)
   const checkingIds = new Set<string>()
 
@@ -169,13 +204,27 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function checkinAll() {
+    let unlisten: UnlistenFn | undefined
     try {
       checkingIn.value = true
+      // 后端并行签到:每个账号完成推送 checkin-progress,即时刷新该账号与日志
+      unlisten = await listen('checkin-progress', () => {
+        fetchAccounts()
+        fetchLogs()
+      })
       const result = await invoke<Array<[Account, CheckinResult]>>('checkin_all')
       await fetchAccounts()
       await fetchLogs()
+      // 签到完成后查询各账号可用积分,与「立即签到」保持行为一致
+      const ids = result
+        .filter(([, r]) => r?.success)
+        .map(([a]) => a.id)
+      await Promise.all(ids.map(id => getAccountPoints(id).catch(() => null)))
+      await fetchAccounts()
       return result
     } finally {
+      unlisten?.()
+      unlisten = undefined
       checkingIn.value = false
     }
   }
@@ -362,6 +411,7 @@ export const useAppStore = defineStore('app', () => {
     importDesktopAccount,
     updateAccount,
     deleteAccount,
+    reorderAccounts,
     checkinAccount,
     checkinAll,
     getAccountPoints,

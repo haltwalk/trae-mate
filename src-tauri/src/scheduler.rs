@@ -105,6 +105,35 @@ async fn run_auto_checkin(app: AppHandle) {
     let settings = state.inner().data.lock().unwrap().get_settings();
 
     let results = perform_all_checkin(client.inner(), state.inner()).await;
+    // 定时签到后:对签到涉及的每个账号重查真实总积分并落库(与手动签到积分一致,
+    // 避免界面只显示"签到前估算值 base+gained").
+    for (account, r) in &results {
+        if !r.success {
+            continue;
+        }
+        let acct = state
+            .inner()
+            .data
+            .lock()
+            .unwrap()
+            .get_accounts()
+            .iter()
+            .find(|a| a.id == account.id)
+            .cloned();
+        let Some(acct) = acct else {
+            continue;
+        };
+        let pr = crate::checkin::get_total_points(&acct, client.inner(), state.inner()).await;
+        if pr.success {
+            let mut data = state.inner().data.lock().unwrap();
+            data.update_account(
+                &acct.id,
+                crate::checkin::points_update_json(&pr),
+            );
+            let _ = data.save(&state.inner().path);
+        }
+    }
+
     let success = results.iter().filter(|(_, r)| r.success).count();
     let failed = results.len() - success;
 

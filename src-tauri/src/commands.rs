@@ -21,9 +21,19 @@ use crate::trae_machine;
 pub fn get_accounts(state: State<'_, AppState>) -> Vec<PublicAccount> {
     let data = state.data.lock().unwrap();
     let main_dev = trae_auth::read_main_aha_device_id();
-    data.get_accounts()
-        .iter()
-        .cloned()
+    let order = data.account_order.clone();
+    let mut accounts = data.get_accounts().to_vec();
+    // 按持久化的展示顺序排序;未在顺序中的账号排在末尾(保持原有相对先后)
+    let order_idx = |a: &Account| {
+        order
+            .iter()
+            .position(|id| id == &a.id)
+            .map(|i| i as i64)
+            .unwrap_or(i64::MAX)
+    };
+    accounts.sort_by_key(order_idx);
+    accounts
+        .into_iter()
         .map(PublicAccount::from)
         // 主账号无独立 data-dir(用主目录机器码签到),展示层用主机器码填充 checkin_device_id,
         // 让前端也能显示 16 位设备码;多开账号保持自身独立签到设备不变。
@@ -34,6 +44,15 @@ pub fn get_accounts(state: State<'_, AppState>) -> Vec<PublicAccount> {
             a
         })
         .collect()
+}
+
+/// 保存账号卡片的新展示顺序(前端拖拽完成后调用)
+#[tauri::command]
+pub fn reorder_accounts(order: Vec<String>, state: State<'_, AppState>) -> AppResult<bool> {
+    let mut data = state.data.lock().unwrap();
+    data.account_order = order;
+    data.save(&state.path)?;
+    Ok(true)
 }
 
 /// 导入当前 TRAE 桌面账号:读取桌面凭据 -> DPAPI 加密 -> upsert 存储
@@ -52,6 +71,9 @@ pub fn import_desktop_account(state: State<'_, AppState>) -> AppResult<PublicAcc
         last_checkin_result: None,
         last_checkin_message: None,
         points: None,
+        points_updated_at: None,
+        points_details: vec![],
+        points_response: None,
         enabled: true,
         desktop_user_id: Some(cred.user_id.clone()),
         encrypted_credential: Some(encrypted),
@@ -118,10 +140,30 @@ pub async fn checkin_account(
 
 #[tauri::command]
 pub async fn checkin_all(
+    app: AppHandle,
     state: State<'_, AppState>,
     client: State<'_, reqwest::Client>,
 ) -> AppResult<Vec<(PublicAccount, CheckinResult)>> {
-    Ok(checkin::perform_all_checkin(client.inner(), state.inner()).await)
+    // 并行签到:每个账号完成即通过事件推送,前端即时刷新
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(PublicAccount, CheckinResult)>(16);
+    let app = app.clone();
+    let emit_task = tauri::async_runtime::spawn(async move {
+        while let Some((account, result)) = rx.recv().await {
+            let payload = serde_json::json!({
+                "accountId": account.id,
+                "accountName": account.name,
+                "result": {
+                    "success": result.success,
+                    "message": result.message,
+                    "points": result.points,
+                }
+            });
+            let _ = app.emit("checkin-progress", payload);
+        }
+    });
+    let results = checkin::run_all_checkin(client.inner(), state.inner(), Some(tx)).await;
+    let _ = emit_task.await;
+    Ok(results)
 }
 
 #[tauri::command]
@@ -136,9 +178,9 @@ pub async fn get_account_points(
     };
     let account = account.ok_or_else(|| AppError::NotFound(id.clone()))?;
     let result = checkin::get_total_points(&account, client.inner(), state.inner()).await;
-    if let (true, Some(tp)) = (result.success, result.total_points) {
+    if result.success {
         let mut data = state.data.lock().unwrap();
-        data.update_account(&id, serde_json::json!({ "points": tp }));
+        data.update_account(&id, checkin::points_update_json(&result));
         let _ = data.save(&state.path);
     }
     Ok(result)
@@ -570,6 +612,9 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
         last_checkin_result: None,
         last_checkin_message: None,
         points: None,
+        points_updated_at: None,
+        points_details: vec![],
+        points_response: None,
         enabled: true,
         desktop_user_id: Some(user_id.clone()),
         encrypted_credential: Some(encrypted),
@@ -695,6 +740,9 @@ pub fn import_account_from_dir(
                 last_checkin_result: None,
                 last_checkin_message: None,
                 points: None,
+                points_updated_at: None,
+                points_details: vec![],
+        points_response: None,
                 enabled: true,
                 desktop_user_id: Some(cred.user_id.clone()),
                 encrypted_credential: Some(encrypted),

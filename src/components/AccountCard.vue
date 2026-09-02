@@ -26,9 +26,29 @@
       </div>
       <div class="info-row">
         <span class="info-label">总积分</span>
-        <span class="info-value points">
+        <span
+          class="info-value points"
+          :title="pointsTooltip"
+          :class="{ clickable: !!account.pointsResponse }"
+          @click="toggleResp($event)"
+        >
           {{ account.points || 0 }} 分
         </span>
+      </div>
+      <!-- 各类型可用积分余额明细:仅存在多类时才展示,同类型已聚合去重 -->
+      <div
+        v-if="pointsGroups.length > 1"
+        class="points-details"
+      >
+        <div
+          v-for="(d, i) in pointsGroups"
+          :key="i"
+          class="points-detail-row"
+          :title="detailTooltip(d)"
+        >
+          <span class="info-label">{{ d.name }}</span>
+          <span class="info-value detail-points">{{ d.remaining }} 分</span>
+        </div>
       </div>
       <div class="info-row">
         <span class="info-label">添加时间</span>
@@ -122,11 +142,26 @@
       <div class="edit-actions"><button class="btn btn-sm btn-outline" @click="cancelEdit">取消</button><button class="btn btn-sm btn-primary" @click="saveEdit">保存</button></div>
     </div>
   </div>
+
+  <!-- 积分查询接口出参悬浮层(美化格式化的 JSON) -->
+  <Teleport to="body">
+    <div
+      v-if="respPopover.visible"
+      class="resp-popover"
+      :style="respPopover.style"
+    >
+      <div class="resp-popover-head">
+        <span>积分查询接口出参</span>
+        <button class="resp-popover-close" @click="respPopover.visible = false">×</button>
+      </div>
+      <pre class="resp-popover-body">{{ formatJson(account.pointsResponse) }}</pre>
+    </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
-import { useAppStore, type Account, type InstanceState } from '../stores/app'
+import { useAppStore, type Account, type PointsDetail, type InstanceState } from '../stores/app'
 
 const props = defineProps<{
   account: Account
@@ -139,6 +174,44 @@ const checkingIn = ref(false)
 const launching = ref(false)
 const refreshingCred = ref(false)
 const instanceState = ref<InstanceState>({ running: false, source: 'none', isMainAccount: false })
+
+// ===== 积分查询接口出参悬浮 =====
+const respPopover = ref<{ visible: boolean; style: { top: string; left: string } }>({
+  visible: false,
+  style: { top: '0', left: '0' },
+})
+
+function toggleResp(e: MouseEvent) {
+  if (!props.account.pointsResponse) return
+  if (respPopover.value.visible) {
+    respPopover.value.visible = false
+    return
+  }
+  respPopover.value.visible = true
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  const offset = 8
+  const height = 420
+  const width = Math.min(560, window.innerWidth - offset * 2)
+  let top = rect.bottom + offset
+  if (top + height > window.innerHeight) top = rect.top - offset - height
+  // 水平方向 clamp,避免超出右缘被遮挡
+  let left = rect.left
+  if (left + width + offset > window.innerWidth) left = window.innerWidth - width - offset
+  if (left < offset) left = offset
+  respPopover.value.style = {
+    top: `${Math.max(offset, top)}px`,
+    left: `${left}px`,
+  }
+}
+
+function formatJson(s: string | undefined): string {
+  if (!s) return ''
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2)
+  } catch {
+    return s
+  }
+}
 
 onMounted(async () => {
   instanceState.value = await store.getInstanceState(props.account.id)
@@ -159,7 +232,10 @@ const statusText = computed(() => {
   const lastDate = new Date(props.account.lastCheckinAt).toDateString()
 
   if (lastDate === today) {
-    return props.account.lastCheckinResult === 'success' ? '今日已签' : '今日失败'
+    const r = props.account.lastCheckinResult
+    if (r === 'success') return '今日已签'
+    if (r === 'already') return '今日已签到'
+    return '今日失败'
   }
   return '待签到'
 })
@@ -172,7 +248,10 @@ const statusBadgeClass = computed(() => {
   const lastDate = new Date(props.account.lastCheckinAt).toDateString()
 
   if (lastDate === today) {
-    return props.account.lastCheckinResult === 'success' ? 'badge-success' : 'badge-danger'
+    const r = props.account.lastCheckinResult
+    if (r === 'success') return 'badge-success'
+    if (r === 'already') return 'badge-info'
+    return 'badge-danger'
   }
   return 'badge-info'
 })
@@ -181,6 +260,47 @@ const lastCheckinText = computed(() => {
   if (!props.account.lastCheckinAt) return '从未签到'
   return formatDateTime(props.account.lastCheckinAt)
 })
+
+const pointsTooltip = computed(() => {
+  if (!props.account.pointsUpdatedAt) return ''
+  return `积分更新于 ${pointsUpdatedText.value}`
+})
+
+const pointsUpdatedText = computed(() => {
+  if (!props.account.pointsUpdatedAt) return ''
+  const d = new Date(props.account.pointsUpdatedAt)
+  const now = Date.now()
+  const diff = now - props.account.pointsUpdatedAt
+  if (diff < 60000) return '刚刚'
+  if (diff < 3600000) return `${Math.floor(diff / 60000)} 分钟前`
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)} 小时前`
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+})
+
+// 各类型可用积分明细:按类型名聚合(同批重复权益合并),丢弃剩余 0 的行
+const pointsGroups = computed<PointsDetail[]>(() => {
+  const list = props.account.pointsDetails || []
+  const map = new Map<string, PointsDetail>()
+  for (const d of list) {
+    if (d.remaining <= 0) continue
+    const cur = map.get(d.name)
+    if (cur) {
+      cur.remaining += d.remaining
+      cur.total += d.total
+      if (d.expireAt && (!cur.expireAt || d.expireAt < cur.expireAt)) cur.expireAt = d.expireAt
+    } else {
+      map.set(d.name, { ...d })
+    }
+  }
+  return [...map.values()]
+})
+
+// 单类积分 tooltip:剩余/总额/到期时间(未知时不显示到期)
+const detailTooltip = (d: PointsDetail): string => {
+  const base = `${d.name}: 剩余 ${d.remaining}，总额 ${d.total}`
+  if (d.expireAt && d.expireAt > 0) return `${base}，到期 ${formatDateTime(d.expireAt)}`
+  return base
+}
 
 const credentialStatusText = computed(() => {
   if (props.account.credentialStatus === 'expired') return '凭证已失效，请打开 TRAE 实例刷新'
@@ -412,9 +532,86 @@ function formatDateTime(timestamp: number): string {
   white-space: nowrap;
 }
 
-.info-value.points {
+/* 总积分:单行,黄色强调 */
+.points {
   color: var(--warning);
   font-weight: 700;
+}
+
+/* 有积分查询出参时可点击查看 */
+.points.clickable {
+  cursor: pointer;
+}
+
+/* 积分查询接口出参悬浮层 */
+.resp-popover {
+  position: fixed;
+  z-index: 9999;
+  width: 560px;
+  max-width: calc(100vw - 32px);
+  max-height: 420px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-elevated, var(--surface));
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-modal, 0 8px 30px rgba(0, 0, 0, 0.25));
+  overflow: hidden;
+}
+
+.resp-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: var(--surface-deep);
+  border-bottom: 1px solid var(--border);
+}
+
+.resp-popover-close {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.resp-popover-close:hover {
+  color: var(--text-primary);
+}
+
+.resp-popover-body {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: 12px 14px;
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre;
+}
+
+/* 各类型可用积分明细:缩进,行高更紧凑,弱化层级 */
+.points-details {
+  margin: 2px 0 2px 16px;
+  border-left: 2px solid var(--text-muted);
+  padding-left: 10px;
+}
+
+.points-detail-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 3px 0;
+}
+
+.detail-points {
+  font-weight: 600;
 }
 
 /* 设备码数值:与其它信息行一致,不加额外颜色 */

@@ -14,11 +14,20 @@ pub struct Account {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_checkin_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub last_checkin_result: Option<String>, // "success" | "failed" | "pending"
+    pub last_checkin_result: Option<String>, // "success" | "already" | "failed" | "pending"
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_checkin_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub points: Option<i64>,
+    /// 总积分最近一次真实刷新时间(毫秒)。仅真实查询接口成功落库时更新。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub points_updated_at: Option<i64>,
+    /// 各类型可用积分余额明细(来源 user_current_entitlement_list)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points_details: Vec<EntitlementDetail>,
+    /// user_current_entitlement_list 的原始出参(JSON 字符串),供前端格式化悬浮展示
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub points_response: Option<String>,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub desktop_user_id: Option<String>,
@@ -53,6 +62,11 @@ pub struct PublicAccount {
     pub last_checkin_result: Option<String>,
     pub last_checkin_message: Option<String>,
     pub points: Option<i64>,
+    pub points_updated_at: Option<i64>,
+    /// 各类型可用积分余额明细
+    pub points_details: Vec<EntitlementDetail>,
+    /// user_current_entitlement_list 的原始出参(JSON 字符串)
+    pub points_response: Option<String>,
     pub enabled: bool,
     pub desktop_user_id: Option<String>,
     pub credential_status: Option<String>,
@@ -73,6 +87,9 @@ impl From<Account> for PublicAccount {
             last_checkin_result: a.last_checkin_result,
             last_checkin_message: a.last_checkin_message,
             points: a.points,
+            points_updated_at: a.points_updated_at,
+            points_details: a.points_details,
+            points_response: a.points_response,
             enabled: a.enabled,
             desktop_user_id: a.desktop_user_id,
             credential_status: a.credential_status,
@@ -91,10 +108,13 @@ pub struct CheckinLog {
     pub account_id: String,
     pub account_name: String,
     pub time: i64,
-    pub result: String, // "success" | "failed"
+    pub result: String, // "success" | "already" | "failed"
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub points_gained: Option<i64>,
+    /// 本次签到时的可用积分余额(签到后)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub points_balance: Option<i64>,
 }
 
 /// 应用设置(仅 desktop 模式相关字段)
@@ -237,6 +257,26 @@ pub struct PointsResult {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_points: Option<i64>,
+    /// 各类型可用积分余额明细(来源 user_current_entitlement_list)
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub details: Vec<EntitlementDetail>,
+    /// 查询接口(user_current_entitlement_list)的原始出参(JSON 字符串)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub points_response: Option<String>,
+}
+
+/// 单类积分权益的可用余额
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntitlementDetail {
+    /// 权益名称/类型,如 "签到奖励"
+    pub name: String,
+    /// 总配额
+    pub total: i64,
+    /// 剩余可用
+    pub remaining: i64,
+    /// 到期时间(毫秒),未知时 0
+    pub expire_at: i64,
 }
 
 /// 多开启动结果

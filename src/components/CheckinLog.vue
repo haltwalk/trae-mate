@@ -22,6 +22,14 @@
           </button>
           <button
             class="filter-tab"
+            :class="{ active: filter === 'already' }"
+            @click="filter = 'already'"
+          >
+            已签到
+            <span class="count already">{{ alreadyCount }}</span>
+          </button>
+          <button
+            class="filter-tab"
             :class="{ active: filter === 'failed' }"
             @click="filter = 'failed'"
           >
@@ -54,7 +62,7 @@
           <div class="col-account">账号</div>
           <div class="col-result">结果</div>
           <div class="col-message">详情</div>
-          <div class="col-points">积分</div>
+          <div class="col-points">可用积分</div>
         </div>
         <div class="log-body">
           <div
@@ -67,8 +75,8 @@
               <span class="account-tag">{{ log.accountName }}</span>
             </div>
             <div class="col-result">
-              <span class="badge" :class="log.result === 'success' ? 'badge-success' : 'badge-danger'">
-                {{ log.result === 'success' ? '成功' : '失败' }}
+              <span class="badge" :class="statusBadge(log.result)">
+                {{ statusText(log.result) }}
               </span>
             </div>
             <div class="col-message">
@@ -77,7 +85,12 @@
               </span>
             </div>
             <div class="col-points">
-              <span v-if="log.pointsGained" class="points-gain">+{{ log.pointsGained }}</span>
+              <template v-if="log.pointsBalance != null">
+                <span
+                  class="points-balance"
+                  :title="`签到后可用积分(usage_summary)`"
+                >{{ log.pointsBalance }}</span>
+              </template>
               <span v-else class="points-none">-</span>
             </div>
           </div>
@@ -100,7 +113,7 @@ import { useAppStore } from '../stores/app'
 import Icon from './Icon.vue'
 
 const store = useAppStore()
-const filter = ref<'all' | 'success' | 'failed'>('all')
+const filter = ref<'all' | 'success' | 'already' | 'failed'>('all')
 
 const filteredLogs = computed(() => {
   if (filter.value === 'all') return store.logs
@@ -108,7 +121,20 @@ const filteredLogs = computed(() => {
 })
 
 const successCount = computed(() => store.logs.filter(l => l.result === 'success').length)
+const alreadyCount = computed(() => store.logs.filter(l => l.result === 'already').length)
 const failedCount = computed(() => store.logs.filter(l => l.result === 'failed').length)
+
+function statusText(result: string): string {
+  if (result === 'success') return '成功'
+  if (result === 'already') return '已签到'
+  return '失败'
+}
+
+function statusBadge(result: string): string {
+  if (result === 'success') return 'badge-success'
+  if (result === 'already') return 'badge-info'
+  return 'badge-danger'
+}
 
 function formatTime(timestamp: number): string {
   const date = new Date(timestamp)
@@ -200,6 +226,10 @@ onMounted(() => {
 
 .filter-tab .count.success {
   color: var(--success);
+}
+
+.filter-tab .count.already {
+  color: var(--accent);
 }
 
 .filter-tab .count.danger {
@@ -311,13 +341,13 @@ onMounted(() => {
 }
 
 .col-points {
-  width: 80px;
+  width: 110px;
   flex-shrink: 0;
   text-align: right;
 }
 
-.points-gain {
-  color: var(--success);
+.points-balance {
+  color: var(--warning);
   font-weight: 700;
 }
 
