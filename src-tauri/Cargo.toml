@@ -1,6 +1,6 @@
 [package]
 name = "trae-mate"
-version = "1.2.2"
+version = "1.2.3"
 description = "Trae Work 签到与多开账号管理 - Tauri2 版"
 authors = ["traemate"]
 edition = "2021"
