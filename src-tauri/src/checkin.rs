@@ -17,6 +17,21 @@ const CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
 
 /// 今日已签到时的消息文案,也是日志三态判定的依据
 pub const ALREADY_CHECKED_IN: &str = "今日已签到";
+
+/// 服务端业务码 9074:设备未在本机登记/设备冲突(device 维限额)。
+/// 此时重试无意义(设备没登记多少次都不行),需用户在本机重登一次让客户端把设备登记到该账号。
+pub const DEVICE_UNREGISTERED_CODE: i64 = 9074;
+
+/// 对已知「设备未登记/冲突」错误附加可操作指引;其余错误原样返回(保留服务端原文)。
+fn device_msg(raw: &str, code: Option<i64>) -> String {
+    if code == Some(DEVICE_UNREGISTERED_CODE) {
+        format!(
+                    "设备未在本机登记或设备冲突(9074)，签到被服务端拒绝。请先在本机打开该账号的 TRAE 实例登录一次刷新设备登记后再签到。原由：{raw}"
+                )
+    } else {
+        raw.to_string()
+    }
+}
 const CREDITS_BALANCE_PATHS: &[&str] = &[
     "/trae/api/v2/pay/user_current_entitlement_list",
     "/trae/api/v2/ug/credits/balance",
@@ -37,6 +52,16 @@ fn api_succeeded(data: &Value) -> bool {
         || data.get("code").and_then(|v| v.as_str()).map(|s| s == "0" || s == "200").unwrap_or(false)
         || data.get("success").and_then(|v| v.as_bool()).unwrap_or(false)
         || data.get("status").and_then(|v| v.as_str()).map(|s| s == "success").unwrap_or(false)
+}
+
+/// 提取服务端响应中的业务错误码(如 9074 设备忙 / 9095 当日已签),无则 None
+fn extract_error_code(data: Option<&Value>) -> Option<i64> {
+    let d = data?;
+    d.get("code").and_then(|v| v.as_i64()).or_else(|| {
+        d.get("code")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+    })
 }
 
 /// 将回读采纳的凭据加密回写应用存储(应用不主动刷新 token,不回写实例目录)
@@ -199,7 +224,9 @@ pub async fn checkin_by_desktop(
             return CheckinResult {
                 success: false,
                 message: e.to_string(),
+                error_code: None,
                 points: None,
+                trace: None,
             }
         }
     };
@@ -212,7 +239,168 @@ pub async fn checkin_by_desktop(
     CheckinResult {
         success: false,
         message: "签到接口鉴权失败(token 已失效)，请打开该账号的 TRAE 实例让客户端刷新后再试".into(),
+        error_code: None,
         points: None,
+        trace: None,
+    }
+}
+
+/// 强制签到(直连领取):跳过 status 预检,直接 POST claim。
+/// 场景:状态预检异常/风控但用户仍想直接尝试领取,或一次性手工补签。
+/// 复用与 checkin_by_desktop 一致的凭据回读与鉴权失败降级。
+pub async fn force_checkin_by_desktop(
+    account: &Account,
+    client: &reqwest::Client,
+    state: &AppState,
+) -> CheckinResult {
+    let cred = match get_valid_credential(account, state).await {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckinResult {
+                success: false,
+                message: e.to_string(),
+                error_code: None,
+                points: None,
+                trace: None,
+            }
+        }
+    };
+    let (result, auth_failed) = force_checkin_once(&cred, client).await;
+    if !auth_failed {
+        return result;
+    }
+    mark_credential_expired(state, &account.id);
+    CheckinResult {
+        success: false,
+        message: "签到接口鉴权失败(token 已失效)，请打开该账号的 TRAE 实例让客户端刷新后再试".into(),
+        error_code: None,
+        points: None,
+        trace: None,
+    }
+}
+
+/// 直接 POST claim(不做 status 预检),采集 claim 一步出入参到 trace。
+/// 返回 (结果, 是否疑似鉴权失败)。via Handle,不回读状态。
+async fn force_checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinResult, bool) {
+    let headers = auth_headers(cred);
+    let host = &cred.host;
+    let mut trace: Vec<ApiTraceEntry> = Vec::new();
+
+    let claim_url = format!("{}{}", host, CLAIM_PATH);
+    let claim_headers_json = headers_to_value(&headers);
+    let resp = match client
+        .post(&claim_url)
+        .headers(headers)
+        .json(&json!({}))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                CheckinResult {
+                    success: false,
+                    message: format!("TRAE 桌面端强制签到失败: {e}"),
+                    error_code: None,
+                    points: None,
+                    trace: Some(trace_to_string(&trace)),
+                },
+                false,
+            )
+        }
+    };
+    let http_status = resp.status().as_u16();
+    let claim_data: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                CheckinResult {
+                    success: false,
+                    message: format!("解析签到结果失败: {e}"),
+                    error_code: None,
+                    points: None,
+                    trace: Some(trace_to_string(&trace)),
+                },
+                false,
+            )
+        }
+    };
+    trace.push(ApiTraceEntry {
+        name: "claim",
+        method: "POST",
+        url: claim_url,
+        headers: claim_headers_json,
+        request: json!({}),
+        http_status,
+        response: claim_data.clone(),
+    });
+    eprintln!(
+        "[checkin] 强制领取 HTTP {} {} 凭据={}",
+        http_status,
+        claim_data,
+        cred_fingerprint(cred)
+    );
+
+    if is_auth_failure(http_status, Some(&claim_data)) {
+        return (
+            CheckinResult {
+                success: false,
+                message: "签到接口鉴权失败(token 已失效)".into(),
+                error_code: extract_error_code(Some(&claim_data)),
+                points: None,
+                trace: Some(trace_to_string(&trace)),
+            },
+            true,
+        );
+    }
+
+    if api_succeeded(&claim_data) {
+        let msg = {
+            let m = claim_data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .or_else(|| claim_data.get("msg").and_then(|v| v.as_str()));
+            match m {
+                Some(s) if s == "success" => "强制签到成功".to_string(),
+                Some(s) => s.to_string(),
+                None => "强制签到成功".to_string(),
+            }
+        };
+        let points = claim_data
+            .get("data")
+            .and_then(|d| d.get("points"))
+            .and_then(|v| v.as_i64())
+            .or_else(|| claim_data.get("points").and_then(|v| v.as_i64()))
+            .or(Some(200));
+        (
+            CheckinResult {
+                success: true,
+                message: msg,
+                error_code: extract_error_code(Some(&claim_data)),
+                points,
+                trace: Some(trace_to_string(&trace)),
+            },
+            false,
+        )
+    } else {
+        let code = extract_error_code(Some(&claim_data));
+        let raw_msg = claim_data
+            .get("message")
+            .and_then(|v| v.as_str())
+            .or_else(|| claim_data.get("msg").and_then(|v| v.as_str()))
+            .unwrap_or("签到失败")
+            .to_string();
+        (
+            CheckinResult {
+                success: false,
+                message: device_msg(&raw_msg, code),
+                error_code: code,
+                points: None,
+                trace: Some(trace_to_string(&trace)),
+            },
+            false,
+        )
     }
 }
 
@@ -229,10 +417,67 @@ fn cred_fingerprint(cred: &Credential) -> String {
     )
 }
 
-/// 用给定凭据执行一次签到(查询状态 -> 领取)。返回 (结果, 是否疑似鉴权失败)
+/// 一步接口调用记录:URL、方法、请求头、请求出入参与响应
+struct ApiTraceEntry {
+    name: &'static str,
+    method: &'static str,
+    url: String,
+    headers: Value,
+    request: Value,
+    http_status: u16,
+    response: Value,
+}
+
+impl ApiTraceEntry {
+    fn to_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "method": self.method,
+            "url": self.url,
+            "headers": self.headers,
+            "request": self.request,
+            "httpStatus": self.http_status,
+            "response": self.response,
+        })
+    }
+}
+
+/// 将请求头序列化为 JSON,敏感值(token)脱敏、保留设备码等诊断关键信息
+fn headers_to_value(headers: &reqwest::header::HeaderMap) -> Value {
+    let mut map = serde_json::Map::new();
+    for (k, v) in headers.iter() {
+        let key = k.as_str().to_string();
+        let value = match v.to_str() {
+            Ok(s) => {
+                // token 脱敏:保留前缀与尾部,中间打码
+                if key.eq_ignore_ascii_case("authorization") || key == "cloud-ide-jwt" {
+                    if s.len() > 12 {
+                        format!("{}****{}", &s[..6], &s[s.len() - 4..])
+                    } else {
+                        "***".to_string()
+                    }
+                } else {
+                    s.to_string()
+                }
+            }
+            Err(_) => "<binary>".to_string(),
+        };
+        map.insert(key, Value::String(value));
+    }
+    Value::Object(map)
+}
+
+fn trace_to_string(entries: &[ApiTraceEntry]) -> String {
+    let arr: Vec<Value> = entries.iter().map(ApiTraceEntry::to_json).collect();
+    serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// 用给定凭据执行一次签到(查询状态 -> 领取)。返回 (结果, 是否疑似鉴权失败)。
+/// 同时采集每一步接口的出入参(请求/响应),写入结果的 trace 字段供前端展示。
 async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinResult, bool) {
     let headers = auth_headers(cred);
     let host = &cred.host;
+    let mut trace: Vec<ApiTraceEntry> = Vec::new();
 
     // 1. 查询签到状态
     let status_url = format!("{}{}", host, STATUS_PATH);
@@ -250,7 +495,9 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 CheckinResult {
                     success: false,
                     message: format!("TRAE 桌面端签到失败: {e}"),
+                    error_code: None,
                     points: None,
+                    trace: None,
                 },
                 false,
             )
@@ -264,12 +511,23 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 CheckinResult {
                     success: false,
                     message: format!("解析签到状态失败: {e}"),
+                    error_code: None,
                     points: None,
+                    trace: None,
                 },
                 false,
             )
         }
     };
+    trace.push(ApiTraceEntry {
+        name: "status",
+        method: "POST",
+        url: status_url,
+        headers: headers_to_value(&headers),
+        request: json!({}),
+        http_status,
+        response: status_data.clone(),
+    });
     eprintln!(
         "[checkin] 状态查询 HTTP {} {} 凭据={}",
         http_status,
@@ -282,7 +540,9 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
             CheckinResult {
                 success: false,
                 message: "签到接口鉴权失败(token 已失效)".into(),
+                error_code: extract_error_code(Some(&status_data)),
                 points: None,
+                trace: Some(trace_to_string(&trace)),
             },
             true,
         );
@@ -297,22 +557,28 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
             CheckinResult {
                 success: true,
                 message: ALREADY_CHECKED_IN.into(),
+                error_code: extract_error_code(Some(&status_data)),
                 points: None,
+                trace: Some(trace_to_string(&trace)),
             },
             false,
         );
     }
     if !api_succeeded(&status_data) {
+        let code = extract_error_code(Some(&status_data));
+        let raw_msg = status_data
+            .get("message")
+            .and_then(|v| v.as_str())
+            .or_else(|| status_data.get("msg").and_then(|v| v.as_str()))
+            .unwrap_or("无法获取 TRAE 签到状态")
+            .to_string();
         return (
             CheckinResult {
                 success: false,
-                message: status_data
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| status_data.get("msg").and_then(|v| v.as_str()))
-                    .unwrap_or("无法获取 TRAE 签到状态")
-                    .to_string(),
+                message: device_msg(&raw_msg, code),
+                error_code: code,
                 points: None,
+                trace: Some(trace_to_string(&trace)),
             },
             false,
         );
@@ -320,6 +586,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
 
     // 2. 领取签到
     let claim_url = format!("{}{}", host, CLAIM_PATH);
+    let claim_headers_json = headers_to_value(&headers);
     let resp = match client
         .post(&claim_url)
         .headers(headers)
@@ -334,7 +601,9 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 CheckinResult {
                     success: false,
                     message: format!("TRAE 桌面端签到失败: {e}"),
+                    error_code: None,
                     points: None,
+                    trace: Some(trace_to_string(&trace)),
                 },
                 false,
             )
@@ -348,12 +617,23 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 CheckinResult {
                     success: false,
                     message: format!("解析签到结果失败: {e}"),
+                    error_code: None,
                     points: None,
+                    trace: Some(trace_to_string(&trace)),
                 },
                 false,
             )
         }
     };
+    trace.push(ApiTraceEntry {
+        name: "claim",
+        method: "POST",
+        url: claim_url,
+        headers: claim_headers_json,
+        request: json!({}),
+        http_status,
+        response: claim_data.clone(),
+    });
     eprintln!(
         "[checkin] 领取 HTTP {} {} 凭据={}",
         http_status,
@@ -366,7 +646,9 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
             CheckinResult {
                 success: false,
                 message: "签到接口鉴权失败(token 已失效)".into(),
+                error_code: extract_error_code(Some(&claim_data)),
                 points: None,
+                trace: Some(trace_to_string(&trace)),
             },
             true,
         );
@@ -394,21 +676,27 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
             CheckinResult {
                 success: true,
                 message: msg,
+                error_code: extract_error_code(Some(&claim_data)),
                 points,
+                trace: Some(trace_to_string(&trace)),
             },
             false,
         )
     } else {
+        let code = extract_error_code(Some(&claim_data));
+        let raw_msg = claim_data
+            .get("message")
+            .and_then(|v| v.as_str())
+            .or_else(|| claim_data.get("msg").and_then(|v| v.as_str()))
+            .unwrap_or("签到失败")
+            .to_string();
         (
             CheckinResult {
                 success: false,
-                message: claim_data
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| claim_data.get("msg").and_then(|v| v.as_str()))
-                    .unwrap_or("签到失败")
-                    .to_string(),
+                message: device_msg(&raw_msg, code),
+                error_code: code,
                 points: None,
+                trace: Some(trace_to_string(&trace)),
             },
             false,
         )
@@ -730,7 +1018,29 @@ pub async fn perform_checkin(
     client: &reqwest::Client,
     state: &AppState,
 ) -> CheckinResult {
-    let result = checkin_by_desktop(account, client, state).await;
+    perform_checkin_inner(account, client, state, false).await
+}
+
+/// 强制签到(直连领取,跳过 status 预检),同样回写最后一次签到与日志。
+pub async fn perform_force_checkin(
+    account: &Account,
+    client: &reqwest::Client,
+    state: &AppState,
+) -> CheckinResult {
+    perform_checkin_inner(account, client, state, true).await
+}
+
+async fn perform_checkin_inner(
+    account: &Account,
+    client: &reqwest::Client,
+    state: &AppState,
+    force_direct: bool,
+) -> CheckinResult {
+    let result = if force_direct {
+        force_checkin_by_desktop(account, client, state).await
+    } else {
+        checkin_by_desktop(account, client, state).await
+    };
 
     let now = now_ms();
     let new_points = match (result.points, account.points) {
@@ -753,6 +1063,7 @@ pub async fn perform_checkin(
             "lastCheckinAt": now,
             "lastCheckinResult": status,
             "lastCheckinMessage": result.message,
+            "lastCheckinTrace": result.trace,
             "points": new_points,
         }),
     );
@@ -763,6 +1074,7 @@ pub async fn perform_checkin(
         time: now,
         result: status.into(),
         message: result.message.clone(),
+        error_code: result.error_code,
         points_gained: result.points,
         points_balance: new_points,
     });
@@ -807,14 +1119,28 @@ pub(crate) async fn run_all_checkin(
                 tokio::time::sleep(Duration::from_millis(STAGGER_MS * i as u64)).await;
             }
             let mut last_err = String::new();
+            let mut last_code = None;
             let mut result = None;
             for attempt in 0..=retry_count {
                 let r = perform_checkin(&account, client, state).await;
+                let code = r.error_code;
                 if r.success {
                     result = Some(r);
                     break;
                 }
                 last_err = r.message;
+                last_code = r.error_code;
+                // 设备未登记/冲突(9074):重试无意义,提前终止并给出可操作指引
+                if code == Some(DEVICE_UNREGISTERED_CODE) {
+                    result = Some(CheckinResult {
+                        success: false,
+                        message: last_err.clone(),
+                        error_code: last_code,
+                        points: None,
+                        trace: r.trace,
+                    });
+                    break;
+                }
                 if attempt < retry_count {
                     tokio::time::sleep(Duration::from_secs(retry_delay as u64)).await;
                 }
@@ -824,7 +1150,9 @@ pub(crate) async fn run_all_checkin(
                 None => CheckinResult {
                     success: false,
                     message: last_err,
+                    error_code: last_code,
                     points: None,
+                    trace: None,
                 },
             };
             if let Some(tx) = tx {
@@ -1142,6 +1470,7 @@ mod e2e_tests {
             last_checkin_at: None,
             last_checkin_result: None,
             last_checkin_message: None,
+            last_checkin_trace: None,
             points: None,
             points_updated_at: None,
             points_details: vec![],

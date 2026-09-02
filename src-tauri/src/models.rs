@@ -17,6 +17,9 @@ pub struct Account {
     pub last_checkin_result: Option<String>, // "success" | "already" | "failed" | "pending"
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_checkin_message: Option<String>,
+    /// 上次签到的接口出入参(JSON 字符串,含 status/claim 的请求与响应),供前端点击"上次签到"查看
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_checkin_trace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub points: Option<i64>,
     /// 总积分最近一次真实刷新时间(毫秒)。仅真实查询接口成功落库时更新。
@@ -61,6 +64,8 @@ pub struct PublicAccount {
     pub last_checkin_at: Option<i64>,
     pub last_checkin_result: Option<String>,
     pub last_checkin_message: Option<String>,
+    /// 上次签到的接口出入参(JSON 字符串)
+    pub last_checkin_trace: Option<String>,
     pub points: Option<i64>,
     pub points_updated_at: Option<i64>,
     /// 各类型可用积分余额明细
@@ -86,6 +91,7 @@ impl From<Account> for PublicAccount {
             last_checkin_at: a.last_checkin_at,
             last_checkin_result: a.last_checkin_result,
             last_checkin_message: a.last_checkin_message,
+            last_checkin_trace: a.last_checkin_trace,
             points: a.points,
             points_updated_at: a.points_updated_at,
             points_details: a.points_details,
@@ -110,6 +116,9 @@ pub struct CheckinLog {
     pub time: i64,
     pub result: String, // "success" | "already" | "failed"
     pub message: String,
+    /// 服务端返回的业务错误码(如 9074 设备忙 / 9095 当日已签),无则 None
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub points_gained: Option<i64>,
     /// 本次签到时的可用积分余额(签到后)
@@ -246,7 +255,12 @@ pub struct CheckinResult {
     pub success: bool,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub points: Option<i64>,
+    /// 本次签到涉及的接口出入参(JSON 字符串,含 status/claim 的请求与响应),供前端悬浮展示
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
 }
 
 /// 积分查询结果

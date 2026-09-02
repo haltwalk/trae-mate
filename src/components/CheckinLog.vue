@@ -39,6 +39,10 @@
         </div>
       </div>
       <div class="toolbar-right">
+        <button class="btn btn-sm btn-outline" @click="handleExport">
+          <Icon name="download" :size="14" />
+          <span>导出日志</span>
+        </button>
         <button class="btn btn-sm btn-outline" @click="handleRefresh">
           <Icon name="arrow-path" :size="14" />
           <span>刷新</span>
@@ -80,7 +84,11 @@
               </span>
             </div>
             <div class="col-message">
-              <span class="message-text" :title="log.message">
+              <span
+                class="message-text"
+                :title="`${log.errorCode != null ? `[${log.errorCode}] ` : ''}${log.message}`"
+                @click="openDetail(log)"
+              >
                 {{ log.message }}
               </span>
             </div>
@@ -104,16 +112,74 @@
       <p class="empty-state-text">暂无签到记录</p>
       <p class="empty-state-desc">执行签到后会在这里显示记录</p>
     </div>
+
+    <!-- 日志详情弹层 -->
+    <Teleport to="body">
+      <div v-if="detail" class="detail-mask" @click.self="detail = null">
+        <div class="detail-card card">
+          <div class="detail-head">
+            <span class="detail-title">签到日志详情</span>
+            <button class="detail-close" @click="detail = null">
+              <Icon name="x-mark" :size="16" />
+            </button>
+          </div>
+          <div class="detail-body" v-if="detail">
+            <div class="detail-row">
+              <span class="detail-label">账号</span>
+              <span class="detail-value">{{ detail.accountName }}</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">时间</span>
+              <span class="detail-value">{{ formatTime(detail.time) }}</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">结果</span>
+              <span class="detail-value">
+                <span class="badge" :class="statusBadge(detail.result)">
+                  {{ statusText(detail.result) }}
+                </span>
+              </span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">错误码</span>
+              <span class="detail-value">
+                <template v-if="detail.errorCode != null">{{ detail.errorCode }}</template>
+                <template v-else>-</template>
+              </span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">详情信息</span>
+              <span class="detail-value detail-msg">{{ detail.message }}</span>
+            </div>
+            <div class="detail-row" v-if="detail.pointsGained != null">
+              <span class="detail-label">本次获得</span>
+              <span class="detail-value">{{ detail.pointsGained }} 分</span>
+            </div>
+            <div class="detail-row" v-if="detail.pointsBalance != null">
+              <span class="detail-label">可用余额</span>
+              <span class="detail-value">{{ detail.pointsBalance }} 分</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useAppStore } from '../stores/app'
+import type { CheckinLog } from '../stores/app'
 import Icon from './Icon.vue'
 
 const store = useAppStore()
+const emit = defineEmits(['notify'])
 const filter = ref<'all' | 'success' | 'already' | 'failed'>('all')
+const detail = ref<CheckinLog | null>(null)
+
+function openDetail(log: CheckinLog) {
+  detail.value = log
+}
 
 const filteredLogs = computed(() => {
   if (filter.value === 'all') return store.logs
@@ -148,6 +214,26 @@ function formatTime(timestamp: number): string {
 
 async function handleRefresh() {
   await store.fetchLogs()
+}
+
+const exporting = ref(false)
+
+async function handleExport() {
+  if (exporting.value) return
+  exporting.value = true
+  try {
+    const now = new Date()
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`
+    const name = `trae-checkin-export-${stamp}.json`
+    const path = await store.exportDiagnostics(name)
+    if (path) {
+      emit('notify', `诊断数据已导出: ${path}`, 'success')
+    }
+  } catch (e: any) {
+    emit('notify', '导出失败: ' + (e?.message || e), 'error')
+  } finally {
+    exporting.value = false
+  }
 }
 
 async function handleClear() {
@@ -338,6 +424,11 @@ onMounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-primary);
+  cursor: pointer;
+}
+
+.message-text:hover {
+  color: var(--accent);
 }
 
 .col-points {
@@ -353,5 +444,94 @@ onMounted(() => {
 
 .points-none {
   color: var(--text-muted);
+}
+
+/* 日志详情弹层 */
+.detail-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(2px);
+  padding: 24px;
+}
+
+.detail-card {
+  width: 460px;
+  max-width: 100%;
+  border-radius: var(--r-lg);
+}
+
+.detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border: none;
+  box-shadow: inset 0 -2px 4px var(--shadow-light);
+}
+
+.detail-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.detail-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  background: transparent;
+  border-radius: var(--r-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--t-smooth);
+}
+
+.detail-close:hover {
+  background: var(--surface-deep);
+  color: var(--text-primary);
+}
+
+.detail-body {
+  padding: 8px 18px 16px;
+}
+
+.detail-row {
+  display: flex;
+  gap: 12px;
+  padding: 9px 0;
+  border: none;
+  box-shadow: inset 0 -1px 2px var(--shadow-light);
+}
+
+.detail-row:last-child {
+  box-shadow: none;
+}
+
+.detail-label {
+  width: 68px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding-top: 1px;
+}
+
+.detail-value {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.detail-msg {
+  line-height: 1.5;
 }
 </style>

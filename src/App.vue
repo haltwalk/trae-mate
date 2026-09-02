@@ -119,7 +119,7 @@
       <!-- 内容区域 -->
       <div class="content-area">
         <AccountList v-if="activeTab === 'accounts'" @add-account="showAddModal = true" @notify="showToast" />
-        <CheckinLog v-else-if="activeTab === 'logs'" />
+        <CheckinLog v-else-if="activeTab === 'logs'" @notify="showToast" />
         <SettingsPanel v-else @notify="showToast" />
       </div>
     </main>

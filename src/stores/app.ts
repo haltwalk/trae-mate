@@ -11,6 +11,8 @@ export interface Account {
   lastCheckinAt?: number
   lastCheckinResult?: 'success' | 'already' | 'failed' | 'pending'
   lastCheckinMessage?: string
+  /** 上次签到的接口出入参(JSON 字符串,含 status/claim 的请求/响应),点击"上次签到"查看 */
+  lastCheckinTrace?: string
   points?: number
   /** 总积分最近一次真实刷新时间(毫秒) */
   pointsUpdatedAt?: number
@@ -34,6 +36,8 @@ export interface CheckinLog {
   time: number
   result: 'success' | 'already' | 'failed'
   message: string
+  /** 服务端返回的业务错误码(如 9074 设备忙 / 9095 当日已签) */
+  errorCode?: number
   pointsGained?: number
   /** 本次签到时的可用积分余额(签到后) */
   pointsBalance?: number
@@ -42,6 +46,7 @@ export interface CheckinLog {
 export interface CheckinResult {
   success: boolean
   message: string
+  errorCode?: number
   points?: number
 }
 
@@ -203,6 +208,22 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  // 强制签到(直连领取):跳过状态预检,直接调领取接口。一次性手工补签/状态预检异常时用。
+  async function forceCheckinAccount(id: string) {
+    if (checkingIn.value) return { success: false, message: '签到进行中，请稍候' } as CheckinResult
+    checkingIds.add(id)
+    try {
+      checkingIn.value = true
+      const result = await invoke<CheckinResult>('force_checkin_account', { id })
+      await fetchAccounts()
+      await fetchLogs()
+      return result
+    } finally {
+      checkingIn.value = false
+      checkingIds.delete(id)
+    }
+  }
+
   async function checkinAll() {
     let unlisten: UnlistenFn | undefined
     try {
@@ -257,6 +278,19 @@ export const useAppStore = defineStore('app', () => {
       console.error('清空日志失败:', e)
       throw e
     }
+  }
+
+  /** 导出诊断数据(所有日志 + 账号设备信息)到用户选择的文件,返回导出路径 */
+  async function exportDiagnostics(suggestedName: string): Promise<string | null> {
+    const { save } = await import('@tauri-apps/plugin-dialog')
+    const path = await save({
+      title: '导出诊断数据',
+      defaultPath: suggestedName,
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    })
+    if (!path) return null
+    const saved = await invoke<string>('export_logs', { path })
+    return saved
   }
 
   async function fetchSettings() {
@@ -413,10 +447,12 @@ export const useAppStore = defineStore('app', () => {
     deleteAccount,
     reorderAccounts,
     checkinAccount,
+    forceCheckinAccount,
     checkinAll,
     getAccountPoints,
     fetchLogs,
     clearLogs,
+    exportDiagnostics,
     fetchSettings,
     saveSettings,
     fetchNextRunTime,

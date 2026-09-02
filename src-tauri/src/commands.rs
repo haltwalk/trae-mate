@@ -70,6 +70,7 @@ pub fn import_desktop_account(state: State<'_, AppState>) -> AppResult<PublicAcc
         last_checkin_at: None,
         last_checkin_result: None,
         last_checkin_message: None,
+        last_checkin_trace: None,
         points: None,
         points_updated_at: None,
         points_details: vec![],
@@ -104,13 +105,22 @@ pub fn update_account(
 
 #[tauri::command]
 pub fn delete_account(id: String, state: State<'_, AppState>, app: AppHandle) -> AppResult<bool> {
-    // 关闭该账号的工具实例(若在运行),数据目录保留(用户可日后通过"扫描已有多开目录"重新导入)
+    // 关闭该账号的工具实例(若在运行),并物理删除其独立 data-dir
+    let mut dir_to_delete: Option<String> = None;
     {
         let data = state.data.lock().unwrap();
         if let Some(acc) = data.get_accounts().iter().find(|a| a.id == id) {
             if let Some(dir) = acc.data_dir.as_deref().filter(|s| !s.is_empty()) {
                 if trae_machine::is_instance_running(dir).0 {
                     let _ = trae_machine::kill_instance(dir);
+                }
+                // 仅删除多开账号的独立 data-dir;主账号(无 data_dir / 指向主目录)一律保护不删
+                let dir_protected = match trae_machine::main_data_dir() {
+                    Ok(main) => std::path::Path::new(dir) == main.as_path(),
+                    Err(_) => false,
+                };
+                if !dir_protected {
+                    dir_to_delete = Some(dir.to_string());
                 }
             }
         }
@@ -119,6 +129,18 @@ pub fn delete_account(id: String, state: State<'_, AppState>, app: AppHandle) ->
     data.delete_account(&id);
     data.save(&state.path)?;
     drop(data);
+    // 物理删除独立 data-dir(多开账号);主账号目录保留
+    if let Some(dir) = dir_to_delete {
+        let p = std::path::Path::new(&dir);
+        if p.exists() {
+            std::fs::remove_dir_all(p).map_err(|e| {
+                AppError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("删除账号数据目录失败: {dir} ({e})"),
+                ))
+            })?;
+        }
+    }
     // 刷新托盘菜单:移除已删除账号的快捷聚焦项
     let _ = crate::rebuild_tray_menu(&app);
     Ok(true)
@@ -136,6 +158,22 @@ pub async fn checkin_account(
     };
     let account = account.ok_or_else(|| AppError::NotFound(id.clone()))?;
     Ok(checkin::perform_checkin(&account, client.inner(), state.inner()).await)
+}
+
+/// 强制签到(直连领取):跳过 status 预检,直接 POST claim。
+/// 用于状态预检异常/风控但用户仍想直接尝试领取,或一次性手工补签。
+#[tauri::command]
+pub async fn force_checkin_account(
+    id: String,
+    state: State<'_, AppState>,
+    client: State<'_, reqwest::Client>,
+) -> AppResult<CheckinResult> {
+    let account = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts().iter().find(|a| a.id == id).cloned()
+    };
+    let account = account.ok_or_else(|| AppError::NotFound(id.clone()))?;
+    Ok(checkin::perform_force_checkin(&account, client.inner(), state.inner()).await)
 }
 
 #[tauri::command]
@@ -198,6 +236,60 @@ pub fn clear_logs(state: State<'_, AppState>) -> AppResult<bool> {
     data.clear_logs();
     data.save(&state.path)?;
     Ok(true)
+}
+
+/// 导出诊断数据到指定文件(所有日志 + 账号设备信息),用于排查"繁忙/未注册/入参异常"等问题。
+/// 返回写入的文件路径;成功才落盘。
+#[tauri::command]
+pub fn export_logs(
+    path: String,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let data = state.data.lock().unwrap();
+    let logs = data.get_logs(usize::MAX);
+    let accounts: Vec<serde_json::Value> = data
+        .get_accounts()
+        .iter()
+        .map(|a| serde_json::json!({
+            "name": a.name,
+            "id": a.id,
+            "desktopUserId": a.desktop_user_id,
+            "machineId": a.machine_id,
+            "dataDir": a.data_dir,
+            "checkinDeviceId": a.checkin_device_id,
+            "credentialStatus": a.credential_status,
+            "enabled": a.enabled,
+            "lastCheckinAt": a.last_checkin_at,
+            "lastCheckinResult": a.last_checkin_result,
+            "lastCheckinMessage": a.last_checkin_message,
+            "lastCheckinTrace": a.last_checkin_trace,
+            "points": a.points,
+            "pointsDetails": a.points_details,
+            "pointsResponse": a.points_response,
+        }))
+        .collect();
+    let payload = serde_json::json!({
+        "exportedAt": now_ms(),
+        "exportedAtText": exported_at_text(),
+        "appVersion": option_env!("CARGO_PKG_VERSION").unwrap_or("unknown"),
+        "accounts": accounts,
+        "logs": logs,
+    });
+    let text = serde_json::to_string_pretty(&payload)?;
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+fn exported_at_text() -> String {
+    let ms = now_ms();
+    let secs = ms / 1000;
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    dt
 }
 
 #[tauri::command]
@@ -611,6 +703,7 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
         last_checkin_at: None,
         last_checkin_result: None,
         last_checkin_message: None,
+        last_checkin_trace: None,
         points: None,
         points_updated_at: None,
         points_details: vec![],
@@ -739,6 +832,7 @@ pub fn import_account_from_dir(
                 last_checkin_at: None,
                 last_checkin_result: None,
                 last_checkin_message: None,
+        last_checkin_trace: None,
                 points: None,
                 points_updated_at: None,
                 points_details: vec![],

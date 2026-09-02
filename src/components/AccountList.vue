@@ -99,12 +99,18 @@ const displayOrdered = computed(() => {
 })
 
 // 拖动逻辑(mouse-based,规避 WebView2 原生 DnD 的不稳定)
+// 设计:点击/选区文本不做任何拖拽(保持文本可选中);位移超过阈值后才真正进入拖拽,
+// 避免卡住鼠标选择/拖动只为了排序时被误判为拖拽。
 // 当前正在拖拽的卡片 id(原卡片保持占位,opacity 降低;实际移动用克隆副本)
 const elDragging = ref<string | null>(null)
+// 待判定拖拽的卡片 id(mousedown 先记录,位移超阈值后才真正进入拖拽)
+let pendingDragId: string | null = null
 // 跟随指针的拖动副本(挂到 body,脱离 grid,避免布局塌陷导致滚动条跳动)
 let ghostEl: HTMLElement | null = null
 // 当前落点卡片 id(虚线框高亮)
 const dropTarget = ref<string | null>(null)
+const DRAG_THRESHOLD = 5
+let dragStartX = 0
 let dragStartY = 0
 let dragOffsetX = 0
 let dragOffsetY = 0
@@ -114,28 +120,43 @@ function onPointerStart(e: MouseEvent, id: string) {
   if (t) return // 点击交互控件内部不触发拖拽
   const card = e.currentTarget as HTMLElement
   const rect = card.getBoundingClientRect()
+  dragStartX = e.clientX
   dragStartY = e.clientY
   dragOffsetX = e.clientX - rect.left
   dragOffsetY = e.clientY - rect.top
-  elDragging.value = id
-  dropTarget.value = id
-  // 克隆一份副本跟随指针;原卡片仍在 grid 占位,页面高度不变 -> 滚动条不跳动
-  const gh = card.cloneNode(true) as HTMLElement
-  gh.classList.add('drag-ghost')
-  gh.style.cssText =
-    `position:fixed;left:${rect.left}px;top:${rect.top}px;` +
-    `width:${rect.width}px;margin:0;pointer-events:none;z-index:1000;`
-  document.body.appendChild(gh)
-  ghostEl = gh
+  pendingDragId = id
   window.addEventListener('mousemove', onPointerMove)
   window.addEventListener('mouseup', onPointerUp)
 }
 
 function onPointerMove(e: MouseEvent) {
-  if (!elDragging.value || !ghostEl) return
+  // 尚未进入拖拽:只有位移超过阈值才算"拖动"开始;否则视为点击/选择文本,不拦截
+  if (!elDragging.value) {
+    if (!pendingDragId) return
+    if (Math.abs(e.clientX - dragStartX) < DRAG_THRESHOLD &&
+        Math.abs(e.clientY - dragStartY) < DRAG_THRESHOLD) return
+    // 真正开始拖拽:取消文本选择,创建跟随指针的克隆副本;原卡片仍在 grid 占位(滚动条不跳动)
+    document.getSelection()?.removeAllRanges()
+    const card = document.querySelector(
+      `.card-drag[data-accid="${pendingDragId}"]`
+    ) as HTMLElement | null
+    if (!card) return
+    const rect = card.getBoundingClientRect()
+    dragOffsetX = e.clientX - rect.left
+    dragOffsetY = e.clientY - rect.top
+    elDragging.value = pendingDragId
+    dropTarget.value = pendingDragId
+    const gh = card.cloneNode(true) as HTMLElement
+    gh.classList.add('drag-ghost')
+    gh.style.cssText =
+      `position:fixed;left:${rect.left}px;top:${rect.top}px;` +
+      `width:${rect.width}px;margin:0;pointer-events:none;z-index:1000;`
+    document.body.appendChild(gh)
+    ghostEl = gh
+  }
   // 让副本跟随指针
-  ghostEl.style.left = `${e.clientX - dragOffsetX}px`
-  ghostEl.style.top = `${e.clientY - dragOffsetY}px`
+  ghostEl!.style.left = `${e.clientX - dragOffsetX}px`
+  ghostEl!.style.top = `${e.clientY - dragOffsetY}px`
   // 位移过小视为点击,不重排
   if (Math.abs(e.clientY - dragStartY) < 4) return
   const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null
@@ -153,9 +174,10 @@ function onPointerUp() {
   ghostEl = null
   const dragId = elDragging.value
   const targetId = dropTarget.value
+  pendingDragId = null
   elDragging.value = null
   dropTarget.value = null
-  // 松手时把被拖卡与落点卡交换位置(中间卡片保持不变)
+  // 若未真正进入拖拽(纯点击/文本选择),不交换
   if (dragId && targetId && targetId !== dragId) {
     swapWith(dragId, targetId)
     persistOrder()
@@ -311,8 +333,6 @@ function handleEdit(id: string, newName?: string) {
 .card-drag {
   margin: 0;
   cursor: grab;
-  -webkit-user-select: none;
-  user-select: none;
   transition: transform var(--t-fast, 0.12s ease), opacity var(--t-fast, 0.12s ease);
 }
 

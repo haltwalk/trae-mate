@@ -22,7 +22,11 @@
     <div class="card-body">
       <div class="info-row">
         <span class="info-label">上次签到</span>
-        <span class="info-value">{{ lastCheckinText }}</span>
+        <span
+          class="info-value clickable"
+          :class="{ 'trace-available': !!account.lastCheckinTrace }"
+          @click="toggleTrace($event)"
+        >{{ lastCheckinText }}</span>
       </div>
       <div class="info-row">
         <span class="info-label">总积分</span>
@@ -97,6 +101,15 @@
         <span>{{ checkingIn ? '签到中' : '立即签到' }}</span>
       </button>
       <button
+        class="btn btn-sm btn-outline"
+        @click="handleForceCheckin"
+        :disabled="checkingIn || forceChecking || store.checkingIn"
+        title="跳过状态预检，直接调领取接口（一次性手工补签 / 状态预检异常时）"
+      >
+        <span v-if="forceChecking" class="spinner"></span>
+        <span>{{ forceChecking ? '领取中' : '直接领取' }}</span>
+      </button>
+      <button
         v-if="instanceState.source === 'none'"
         class="btn btn-sm btn-outline"
         @click="handleLaunchMulti"
@@ -157,6 +170,21 @@
       <pre class="resp-popover-body">{{ formatJson(account.pointsResponse) }}</pre>
     </div>
   </Teleport>
+
+  <!-- 上次签到接口出入参悬浮层 -->
+  <Teleport to="body">
+    <div
+      v-if="tracePopover.visible"
+      class="resp-popover"
+      :style="tracePopover.style"
+    >
+      <div class="resp-popover-head">
+        <span>上次签到接口出入参</span>
+        <button class="resp-popover-close" @click="tracePopover.visible = false">×</button>
+      </div>
+      <pre class="resp-popover-body">{{ formatJson(account.lastCheckinTrace) }}</pre>
+    </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">
@@ -171,6 +199,7 @@ const emit = defineEmits(['toggle', 'delete', 'edit', 'notify'])
 const store = useAppStore()
 
 const checkingIn = ref(false)
+const forceChecking = ref(false)
 const launching = ref(false)
 const refreshingCred = ref(false)
 const instanceState = ref<InstanceState>({ running: false, source: 'none', isMainAccount: false })
@@ -199,6 +228,37 @@ function toggleResp(e: MouseEvent) {
   if (left + width + offset > window.innerWidth) left = window.innerWidth - width - offset
   if (left < offset) left = offset
   respPopover.value.style = {
+    top: `${Math.max(offset, top)}px`,
+    left: `${left}px`,
+  }
+}
+
+// ===== 上次签到接口出入参悬浮 =====
+const tracePopover = ref<{ visible: boolean; style: { top: string; left: string } }>({
+  visible: false,
+  style: { top: '0', left: '0' },
+})
+
+function toggleTrace(e: MouseEvent) {
+  if (!props.account.lastCheckinTrace) {
+    emit('notify', '该账号暂无签到出入参记录', 'error')
+    return
+  }
+  if (tracePopover.value.visible) {
+    tracePopover.value.visible = false
+    return
+  }
+  tracePopover.value.visible = true
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  const offset = 8
+  const height = 420
+  const width = Math.min(560, window.innerWidth - offset * 2)
+  let top = rect.bottom + offset
+  if (top + height > window.innerHeight) top = rect.top - offset - height
+  let left = rect.left
+  if (left + width + offset > window.innerWidth) left = window.innerWidth - width - offset
+  if (left < offset) left = offset
+  tracePopover.value.style = {
     top: `${Math.max(offset, top)}px`,
     left: `${left}px`,
   }
@@ -331,6 +391,21 @@ async function handleCheckin() {
     emit('notify', '签到失败: ' + (e?.message || e), 'error')
   } finally {
     checkingIn.value = false
+  }
+}
+
+// 直接领取:跳过状态预检,直接调领取接口。结果同样即时刷新账号与日志。
+async function handleForceCheckin() {
+  if (forceChecking.value) return
+  forceChecking.value = true
+  try {
+    const result = await store.forceCheckinAccount(props.account.id)
+    let msg = result?.message || (result?.success ? '直接领取成功' : '直接领取失败')
+    emit('notify', msg, result?.success ? 'success' : 'error')
+  } catch (e: any) {
+    emit('notify', '直接领取失败: ' + (e?.message || e), 'error')
+  } finally {
+    forceChecking.value = false
   }
 }
 
@@ -541,6 +616,16 @@ function formatDateTime(timestamp: number): string {
 /* 有积分查询出参时可点击查看 */
 .points.clickable {
   cursor: pointer;
+}
+
+/* 上次签到:有点击查看出参时显示手型与主题色 */
+.info-value.clickable {
+  cursor: pointer;
+  transition: color var(--t-smooth);
+}
+
+.info-value.clickable:hover {
+  color: var(--accent);
 }
 
 /* 积分查询接口出参悬浮层 */
