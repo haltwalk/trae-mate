@@ -15,6 +15,9 @@ pub struct StoreData {
     pub logs: Vec<CheckinLog>,
     #[serde(default)]
     pub settings: AppSettings,
+    /// 账号卡片的展示顺序(账号 id 数组,未列出的排在末尾)
+    #[serde(default)]
+    pub account_order: Vec<String>,
 }
 
 /// 应用全局状态:数据 + 存储路径
