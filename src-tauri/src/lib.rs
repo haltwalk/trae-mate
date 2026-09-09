@@ -269,6 +269,7 @@ pub fn run() {
             commands::scan_instance_dirs,
             commands::import_account_from_dir,
             commands::refresh_account_credential,
+            commands::refresh_account_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

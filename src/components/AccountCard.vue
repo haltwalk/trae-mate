@@ -72,6 +72,15 @@
           >
             <Icon name="arrow-path" :size="11" :class="{ spinning: refreshingCred }" />
           </button>
+          <button
+            class="btn-token-refresh"
+            :disabled="refreshingToken"
+            title="无条件调 ExchangeToken 强制刷新 token(调试/手动续期,失败时会显示服务端 code/msg)"
+            @click="handleRefreshToken"
+          >
+            <span v-if="refreshingToken" class="spinner"></span>
+            <span>{{ refreshingToken ? '刷新中' : '刷新Token' }}</span>
+          </button>
         </span>
       </div>
       <!-- 多开实例:展示签到设备码(虚拟设备码标签在左,数字在右) -->
@@ -202,6 +211,7 @@ const checkingIn = ref(false)
 const forceChecking = ref(false)
 const launching = ref(false)
 const refreshingCred = ref(false)
+const refreshingToken = ref(false)
 const instanceState = ref<InstanceState>({ running: false, source: 'none', isMainAccount: false })
 
 // ===== 积分查询接口出参悬浮 =====
@@ -450,6 +460,25 @@ async function handleRefreshCred() {
     emit('notify', '回读凭证失败: ' + (e?.message || e), 'error')
   } finally {
     refreshingCred.value = false
+  }
+}
+
+// 强制刷新 token(调试/手动续期):无条件调 ExchangeToken,结果即时反馈。
+// 失败时后端错误信息已含服务端 code/msg(如 20403 设备不匹配),便于定位问题。
+async function handleRefreshToken() {
+  if (refreshingToken.value) return
+  refreshingToken.value = true
+  try {
+    const r = await store.refreshAccountToken(props.account.id)
+    const exp = r.expiresAt ? new Date(r.expiresAt) : null
+    const expText = exp
+      ? `${exp.getMonth() + 1}/${exp.getDate()} ${String(exp.getHours()).padStart(2, '0')}:${String(exp.getMinutes()).padStart(2, '0')}`
+      : ''
+    emit('notify', expText ? `token 刷新成功，有效期至 ${expText}` : 'token 刷新成功', 'success')
+  } catch (e: any) {
+    emit('notify', '刷新 token 失败: ' + (e?.message || e), 'error')
+  } finally {
+    refreshingToken.value = false
   }
 }
 
@@ -735,6 +764,42 @@ function formatDateTime(timestamp: number): string {
 .btn-refresh-cred:disabled {
   cursor: default;
   color: var(--accent);
+}
+
+/* 强制刷新 token 按钮:小号胶囊,与回读按钮并排 */
+.btn-token-refresh {
+  height: 20px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft-raised);
+  transition: box-shadow var(--t-press), color var(--t-smooth);
+  flex-shrink: 0;
+}
+
+.btn-token-refresh:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+.btn-token-refresh:active:not(:disabled) {
+  box-shadow: var(--shadow-soft-inset);
+}
+
+.btn-token-refresh:disabled {
+  cursor: default;
+  color: var(--accent);
+}
+
+.btn-token-refresh .spinner {
+  width: 9px;
+  height: 9px;
 }
 
 .spinning {

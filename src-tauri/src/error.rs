@@ -13,6 +13,8 @@ pub enum AppError {
     Credential(String),
     #[error("Windows DPAPI 错误: {0}")]
     Dpapi(String),
+    #[error("网络错误: {0}")]
+    Network(String),
     #[error("未找到账号: {0}")]
     NotFound(String),
     #[error("启动失败: {0}")]

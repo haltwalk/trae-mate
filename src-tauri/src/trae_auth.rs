@@ -178,6 +178,49 @@ fn aha_device_id_from_storage(storage: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 读 icube-dc 签名密钥对(解密后的 JSON,含 privateKeyPEM/publicKeyPEM)。
+/// 优先与 device_id 同名的键(与 token 同批签发),回退 storage 里任意 icube-dc 键;
+/// 均缺失或解密失败返回 Null。
+fn read_icube_dc_key_pair(storage: &Value, device_id: &str) -> Value {
+    let encoded = storage
+        .as_object()
+        .and_then(|obj| {
+            obj.get(&format!("iCubeAuthInfo://icube-dc:{device_id}"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    obj.iter().find_map(|(k, v)| {
+                        if k.starts_with("iCubeAuthInfo://icube-dc:") {
+                            v.as_str().map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                })
+        })
+        .unwrap_or_default();
+    if encoded.is_empty() {
+        return Value::Null;
+    }
+    decrypt_trae_auth_info(&encoded)
+        .ok()
+        .unwrap_or_else(|| Value::Null)
+}
+
+/// 读 ahanet/tt_net_config.config 的 device_id(客户端 2.3.78099+ 以该文件作为设备身份
+/// 来源,登录/换 token 时服务端绑定的就是它;手动登录会把实例设备拉回此值)。
+/// 文件格式:`device_id&#*<16位数字>@$*tnc_etag&#*...@$*`。文件不存在/无该字段返回 None。
+pub fn read_tt_net_device_id(data_dir: &Path) -> Option<String> {
+    let cfg_path = data_dir.join("ahanet").join("tt_net_config.config");
+    let content = fs::read_to_string(&cfg_path).ok()?;
+    const MARK: &str = "device_id&#*";
+    let start = content.find(MARK)?;
+    let val_start = start + MARK.len();
+    let rel_end = content[val_start..].find("@$*")?;
+    let dev = content[val_start..val_start + rel_end].trim();
+    (!dev.is_empty()).then(|| dev.to_string())
+}
+
 /// 读取并解密指定 data-dir 的凭据(通用:主目录或独立实例目录均可)
 pub fn read_credentials_from_data_dir(data_dir: &Path) -> AppResult<Credential> {
     let storage_path = data_dir
@@ -199,8 +242,14 @@ pub fn read_credentials_from_data_dir(data_dir: &Path) -> AppResult<Credential> 
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::Credential("TRAE desktop login token is invalid".into()))?;
 
-    // 签到 x-device-id 用 aha 设备ID(icube-dc key 后缀);旧字段 telemetry.devDeviceId 已废弃,仅回退用
-    let device_id = aha_device_id_from_storage(&storage)
+    // 设备身份优先取 ahanet/tt_net_config.config 的 device_id(客户端 2.3.78099+ 以它作为
+    // 身份来源,登录签发的 token 即绑定它)。手动登录/换设备后 storage.json 可能残留多个
+    // icube-dc 键(旧独立设备 + 新机器级设备),盲目取第一个旧键会导致 ExchangeToken 刷新
+    // 时报"Token device not match"(code 20403)。回退第一个 icube-dc 键,再回退废弃字段
+    // telemetry.devDeviceId。
+    let storage_dev = aha_device_id_from_storage(&storage);
+    let device_id = read_tt_net_device_id(data_dir)
+        .or_else(|| storage_dev.clone())
         .or_else(|| {
             storage
                 .get("telemetry.devDeviceId")
@@ -216,20 +265,27 @@ pub fn read_credentials_from_data_dir(data_dir: &Path) -> AppResult<Credential> 
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::Credential("TRAE desktop machine ID is unavailable".into()))?;
 
-    // 签名密钥:iCubeAuthInfo://icube-dc:* (同样解密)
+    // 签名密钥:优先取与设备身份同名(device_id 对应)的 icube-dc 键——密钥与 token 同批
+    // 签发时才匹配,取错键会导致 ExchangeToken 刷新报 20403。仅当同名键缺失时回退任意键。
     let signing_key_encoded = storage
         .as_object()
         .and_then(|obj| {
-            obj.iter().find_map(|(k, v)| {
-                if k.starts_with("iCubeAuthInfo://icube-dc:") {
-                    v.as_str()
-                } else {
-                    None
-                }
-            })
+            let dev = device_id.as_str();
+            obj.get(&format!("iCubeAuthInfo://icube-dc:{dev}"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    obj.iter().find_map(|(k, v)| {
+                        if k.starts_with("iCubeAuthInfo://icube-dc:") {
+                            v.as_str().map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                })
         })
         .ok_or_else(|| AppError::Credential("TRAE desktop signing key is unavailable".into()))?;
-    let signing_key = decrypt_trae_auth_info(signing_key_encoded)?;
+    let signing_key = decrypt_trae_auth_info(&signing_key_encoded)?;
     let private_key_pem = signing_key
         .get("privateKeyPEM")
         .and_then(|v| v.as_str())
@@ -347,29 +403,51 @@ pub fn read_auth_from_data_dir_loose(
         .map(|s| s.to_string())
         .or_else(|| fallback.region.clone());
 
+    // 设备身份优先取 ahanet/tt_net_config.config 的 device_id(与 token 绑定设备一致,
+    // 用于 ExchangeToken 刷新;storage 可能残留多个 icube-dc 键,取错旧键会 20403);
+    // telemetry 可能是多开占位/缺失,兜底快照
+    let device_id = read_tt_net_device_id(data_dir)
+        .or_else(|| aha_device_id_from_storage(&storage))
+        .or_else(|| {
+            storage
+                .get("telemetry.devDeviceId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| fallback.device_id.clone());
+    let machine_id = storage
+        .get("telemetry.machineId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| fallback.machine_id.clone());
+    // 签名密钥:优先取与设备身份同名(device_id 对应)的 icube-dc 键。重登/换设备后
+    // 客户端会在新设备名下写入新密钥对,旧快照密钥与 token 不同批,签名会被服务端
+    // 拒绝(20403 Token device not match)。同名键缺失时回退任意 icube-dc 键,再退快照。
+    let key_pair = read_icube_dc_key_pair(&storage, &device_id);
+    let private_key_pem = key_pair
+        .get("privateKeyPEM")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.private_key_pem.clone());
+    let public_key_pem = key_pair
+        .get("publicKeyPEM")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.public_key_pem.clone());
+
     Ok(Credential {
         token,
         refresh_token: str_field("refreshToken").unwrap_or_else(|| fallback.refresh_token.clone()),
         expires_at,
         refresh_expires_at,
-        // 签到 x-device-id 用实例自身 aha 设备ID(icube-dc key 后缀);telemetry 可能是多开占位/缺失,兜底快照
-        device_id: aha_device_id_from_storage(&storage)
-            .or_else(|| {
-                storage
-                    .get("telemetry.devDeviceId")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| fallback.device_id.clone()),
-        machine_id: storage
-            .get("telemetry.machineId")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| fallback.machine_id.clone()),
-        private_key_pem: fallback.private_key_pem.clone(),
-        public_key_pem: fallback.public_key_pem.clone(),
+        device_id,
+        machine_id,
+        private_key_pem,
+        public_key_pem,
         user_id,
         account_name: account_obj
             .and_then(|a| a.get("username"))
@@ -399,11 +477,12 @@ pub fn read_auth_from_data_dir_loose(
 /// 设备ID模型与「覆盖红线」的完整说明见 trae_instance.rs 顶部模块注释。
 pub fn read_main_aha_device_id() -> Option<String> {
     let appdata = env::var("APPDATA").ok()?;
-    let storage_path = PathBuf::from(&appdata)
-        .join("TRAE SOLO CN")
-        .join("User")
-        .join("globalStorage")
-        .join("storage.json");
+    let dir = PathBuf::from(&appdata).join("TRAE SOLO CN");
+    // 优先 ahanet 设备(客户端当前身份来源);回退 storage 第一个 icube-dc 键
+    if let Some(dev) = read_tt_net_device_id(&dir) {
+        return Some(dev);
+    }
+    let storage_path = dir.join("User").join("globalStorage").join("storage.json");
     let raw = fs::read_to_string(&storage_path).ok()?;
     let storage: Value = serde_json::from_str(&raw).ok()?;
     aha_device_id_from_storage(&storage)

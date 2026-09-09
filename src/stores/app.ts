@@ -39,6 +39,8 @@ export interface CheckinLog {
   /** 服务端返回的业务错误码(如 9074 设备忙 / 9095 当日已签) */
   errorCode?: number
   pointsGained?: number
+  /** 本次签到获得的额外加成积分(extra_credits) */
+  pointsExtra?: number
   /** 本次签到时的可用积分余额(签到后) */
   pointsBalance?: number
 }
@@ -373,6 +375,21 @@ export const useAppStore = defineStore('app', () => {
     return result
   }
 
+  // 强制刷新账号 token(调试/手动续期):无条件调 ExchangeToken 续期并回写,
+  // 返回新有效期与设备信息;失败时错误信息含服务端 code/msg
+  async function refreshAccountToken(id: string) {
+    const result = await invoke<{
+      success: boolean
+      message: string
+      expiresAt: number
+      refreshExpiresAt: number
+      deviceId: string
+      machineId: string
+    }>('refresh_account_token', { id })
+    await fetchAccounts()
+    return result
+  }
+
   // 查询账号实例运行状态(含来源:主实例/工具实例/未运行)
   async function getInstanceState(id: string): Promise<InstanceState> {
     try {
@@ -461,6 +478,7 @@ export const useAppStore = defineStore('app', () => {
     scanInstanceDirs,
     importAccountFromDir,
     refreshCredential,
+    refreshAccountToken,
     getInstanceState,
     focusInstance,
     refreshInstances,

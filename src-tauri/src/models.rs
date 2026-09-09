@@ -121,6 +121,9 @@ pub struct CheckinLog {
     pub error_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub points_gained: Option<i64>,
+    /// 本次签到获得的额外加成积分(extra_credits,如连续签到奖励),无则 None
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub points_extra: Option<i64>,
     /// 本次签到时的可用积分余额(签到后)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub points_balance: Option<i64>,
@@ -258,6 +261,9 @@ pub struct CheckinResult {
     pub error_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub points: Option<i64>,
+    /// 本次签到获得的额外加成积分(extra_credits)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub points_extra: Option<i64>,
     /// 本次签到涉及的接口出入参(JSON 字符串,含 status/claim 的请求与响应),供前端悬浮展示
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<String>,

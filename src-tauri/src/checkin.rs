@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 
 use crate::credentials::{decrypt_credential, encrypt_credential};
@@ -14,6 +15,204 @@ use crate::store::{generate_id, AppState};
 
 const STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
 const CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
+
+// ===== 自动刷新 token(ExchangeToken)=====
+// TRAE 客户端刷新接口:POST {host}/trae/api/v3/oauth/ExchangeToken。
+// 请求体 = ClientID + RefreshToken + DeviceInfo + DeviceProof(RSA-SHA256 签名,与客户端 qDe 一致)。
+// 成功返回 Result{Token, RefreshToken, TokenExpireAt, TokenExpireDuration, RefreshExpireAt};
+// 失败时 ResponseMetadata.Error.Code 为服务端错误码(20324/20101/... 表示刷新令牌失效需重登)。
+
+/// ExchangeToken 刷新接口路径
+const EXCHANGE_TOKEN_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
+/// TRAE SOLO 客户端 ClientID(product.json iCubeApp.authConfig,稳定版)
+const CLIENT_ID_SOLO: &str = "en1oxy7wnw8j9n";
+/// 自动刷新阈值:token 剩余有效期 ≤ 该值且刷新令牌仍有效时,签到前主动调 ExchangeToken 续期
+const AUTO_REFRESH_BEFORE_MS: i64 = 6 * 60 * 60 * 1000; // 6 小时
+/// 客户端版本号。注意:这是 product.json iCubeApp.appVersion(如 "0.1.63"),不是
+/// 构建版本号——服务端 ExchangeToken 的 BoundDeviceID 由整个 DeviceInfo 计算,
+/// 刷新时任何字段(含 ClientVersion/DeviceName/OSInfo 等)与登录签发时不符都会 20403。
+const IDE_VERSION: &str = "0.1.63";
+/// 本机设备信息(与客户端登录请求一致,从 TRAE 登录日志提取):
+/// 服务端设备绑定(BoundDeviceID)包含这些字段,刷新时必须逐字段一致。
+const DEVICE_NAME: &str = "halt的电脑";
+const DEVICE_MODEL: &str = "HP Pro Tower ZHAN 99 G9 Desktop PC";
+const DEVICE_BRAND: &str = "HP";
+const DEVICE_CPU: &str = "Intel(R) Core(TM) i7-14700";
+const OS_INFO: &str = "windows";
+const OS_VERSION: &str = "Windows 11 Home China";
+/// 刷新令牌失效(需重新登录)的服务端错误码,与客户端 YP 常量一致
+const REFRESH_TOKEN_INVALID_CODES: &[&str] = &[
+    "20324", "20101", "20315", "20125", "20126", "20401", "20403",
+];
+
+/// 生成 DeviceProof(与客户端 qDe 完全一致):签名密钥为 EC P-256(PKCS8 PEM),
+/// message = "{method} {path} {client_id} {refresh_token} {timestamp} {nonce}",
+/// ECDSA-SHA256 签名输出 DER 编码后 base64(Node crypto.sign 对 EC 私钥即输出 DER)。
+/// 返回 (signature_base64, timestamp_i64, nonce)——服务端要求 Timestamp 为整数。
+fn device_proof(
+    method: &str,
+    path: &str,
+    client_id: &str,
+    refresh_token: &str,
+    private_key_pem: &str,
+) -> AppResult<(String, i64, String)> {
+    use ecdsa::signature::Signer;
+    use p256::ecdsa::SigningKey;
+    use p256::pkcs8::DecodePrivateKey;
+
+    let signing_key = SigningKey::from_pkcs8_pem(private_key_pem)
+        .map_err(|e| AppError::Credential(format!("解析 EC 私钥失败: {e}")))?;
+    let timestamp = chrono::Utc::now().timestamp();
+    let nonce = hex::encode(rand::random::<[u8; 16]>());
+    // 与客户端 qDe 一致:六段用【换行符】连接(客户端 `[m,p,id,rt,ts,nonce].join("\n")`,
+    // 反引号模板字符串跨行),不是空格。分隔符错了服务端验签失败 → 20403 设备不匹配。
+    let message = format!(
+        "{method}\n{path}\n{client_id}\n{refresh_token}\n{timestamp}\n{nonce}"
+    );
+    let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+    let sig_b64 = general_purpose::STANDARD.encode(signature.to_der().as_bytes());
+    Ok((sig_b64, timestamp, nonce))
+}
+
+/// 宽松解析过期时间为毫秒时间戳(ExchangeToken 响应用,解析失败返回 0)。
+/// 兼容两种格式:ISO 字符串(客户端登录响应)与数字毫秒(刷新/轮换响应,如 1789900046482)。
+fn parse_exp_ms(v: Option<&Value>) -> i64 {
+    let Some(v) = v else {
+        return 0;
+    };
+    if let Some(n) = v.as_i64() {
+        return n;
+    }
+    if let Some(s) = v.as_str() {
+        return chrono::DateTime::parse_from_rfc3339(s)
+            .map(|d| d.timestamp_millis())
+            .unwrap_or(0);
+    }
+    0
+}
+
+/// 调用 TRAE 客户端 ExchangeToken 接口刷新 access token(自动续期,解决账号约 7 天过期)。
+/// 使用 sync 后的实例真实设备身份发起刷新——服务端要求"授权设备 == 换 token 设备"，
+/// 多开签到设备(checkin_device_id)仅用于签到请求头,不参与刷新。
+async fn exchange_token_refresh(
+    cred: &Credential,
+    client: &reqwest::Client,
+) -> AppResult<Credential> {
+    if cred.private_key_pem.is_empty() || cred.refresh_token.is_empty() {
+        return Err(AppError::Credential(
+            "凭据缺少 refresh_token 或签名密钥,无法自动刷新,请重新登录该账号".into(),
+        ));
+    }
+    let host = if cred.host.is_empty() {
+        "https://api.trae.cn".to_string()
+    } else {
+        cred.host.clone()
+    };
+    let url = format!("{host}{EXCHANGE_TOKEN_PATH}");
+    let client_id = CLIENT_ID_SOLO;
+    let (signature, timestamp, nonce) = device_proof(
+        "POST",
+        EXCHANGE_TOKEN_PATH,
+        client_id,
+        &cred.refresh_token,
+        &cred.private_key_pem,
+    )?;
+    let device_info = json!({
+        "DeviceID": cred.device_id,
+        "MachineID": cred.machine_id,
+        "PlatformCode": "SOLO_PC",
+        "DeviceType": "PC",
+        "DeviceName": DEVICE_NAME,
+        "DeviceModel": DEVICE_MODEL,
+        "ClientVersion": IDE_VERSION,
+        "DevicePublicKey": cred.public_key_pem,
+        "DeviceBrand": DEVICE_BRAND,
+        "DeviceCPU": DEVICE_CPU,
+        "OSInfo": OS_INFO,
+        "OSVersion": OS_VERSION,
+    });
+    let body = json!({
+        "ClientID": client_id,
+        "ClientSecret": "",
+        "RefreshToken": cred.refresh_token,
+        "DeviceInfo": device_info,
+        "DeviceProof": {
+            "Signature": signature,
+            "Timestamp": timestamp,
+            "Nonce": nonce,
+        },
+        "IDEVersion": IDE_VERSION,
+    });
+    let resp = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("x-cloudide-token", &cred.token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Network(format!("ExchangeToken 请求失败: {e}")))?;
+    let status = resp.status();
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Network(format!("ExchangeToken 响应解析失败: {e}")))?;
+    // 服务端错误码(客户端约定:这些码表示刷新令牌失效,需重新登录)
+    if let Some(code) = data
+        .pointer("/ResponseMetadata/Error/Code")
+        .and_then(|v| v.as_str())
+    {
+        let msg = data
+            .pointer("/ResponseMetadata/Error/Message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if REFRESH_TOKEN_INVALID_CODES.contains(&code) {
+            return Err(AppError::Credential(format!(
+                "刷新令牌已失效({code}): {msg} [dev={} machine={}]",
+                cred.device_id, cred.machine_id
+            )));
+        }
+        return Err(AppError::Credential(format!(
+            "ExchangeToken 被服务端拒绝: code={code} msg={msg}"
+        )));
+    }
+    if !status.is_success() {
+        return Err(AppError::Network(format!(
+            "ExchangeToken 返回 HTTP {status}: {data}"
+        )));
+    }
+    let result = data
+        .get("Result")
+        .ok_or_else(|| AppError::Credential("ExchangeToken 响应缺少 Result".into()))?;
+    let token = result
+        .get("Token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::Credential("ExchangeToken 响应缺少新 Token".into()))?;
+    let refresh_token = result
+        .get("RefreshToken")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // 与客户端 WDe 一致:TokenExpireAt 已过时若给了 TokenExpireDuration(毫秒)则用 now+duration
+    let token_expire_at = parse_exp_ms(result.get("TokenExpireAt"));
+    let duration_ms = result
+        .get("TokenExpireDuration")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let now = now_ms();
+    let expires_at = if token_expire_at > 0 && now > token_expire_at && duration_ms > 0 {
+        now + duration_ms
+    } else {
+        token_expire_at
+    };
+    let refresh_expires_at = parse_exp_ms(result.get("RefreshExpireAt"));
+    let mut fresh = cred.clone();
+    fresh.token = token.to_string();
+    fresh.refresh_token = refresh_token;
+    fresh.expires_at = expires_at;
+    fresh.refresh_expires_at = refresh_expires_at;
+    Ok(fresh)
+}
 
 /// 今日已签到时的消息文案,也是日志三态判定的依据
 pub const ALREADY_CHECKED_IN: &str = "今日已签到";
@@ -132,6 +331,7 @@ fn is_auth_failure(http_status: u16, data: Option<&Value>) -> bool {
 /// token 已过期时返回明确指引:请打开该账号的 TRAE 实例让客户端刷新后再试。
 async fn get_valid_credential(
     account: &Account,
+    client: &reqwest::Client,
     state: &AppState,
 ) -> AppResult<Credential> {
     // 多开实例签到设备隔离:签到设备ID由 TraeMate 独立持有并持久化(get_or_create_checkin_device_id),
@@ -151,6 +351,33 @@ async fn get_valid_credential(
     if synced.expires_at > now || adopted {
         persist_credential(state, account, &synced);
         cred = synced;
+    }
+    // 自动刷新:token 已过期或即将过期,且刷新令牌(refresh_token)仍有效时,主动调
+    // ExchangeToken 续期,解决账号约 7 天过期后需手动打开 TRAE 刷新/重登的问题。
+    // 设备:用 sync 后的实例真实设备发起刷新("授权设备 == 换 token 设备"),
+    // 多开签到设备(checkin_device_id)仅用于签到请求头,不参与刷新。
+    if !cred.refresh_token.is_empty()
+        && cred.refresh_expires_at > now
+        && cred.expires_at <= now + AUTO_REFRESH_BEFORE_MS
+    {
+        match exchange_token_refresh(&cred, client).await {
+            Ok(fresh) => {
+                // 回写实例目录(客户端下次启动免重新登录)与应用快照
+                crate::trae_instance::write_back_auth_to_instance(account, &fresh);
+                persist_credential(state, account, &fresh);
+                cred = fresh;
+            }
+            Err(e) => {
+                // token 已过期且刷新失败:终止签到,给出明确指引
+                if cred.expires_at <= now {
+                    mark_credential_expired(state, &account.id);
+                    return Err(AppError::Credential(format!(
+                        "自动刷新 token 失败,请重新登录该账号。原因: {e}"
+                    )));
+                }
+                // 仅临近过期:刷新失败不阻断,继续用当前 token 签到(剩余有效期可能不足,签到失败自会提示)
+            }
+        }
     }
     // 多开实例:签到设备ID一律用实例隔离后的设备——快照/回读可能残留被重置的机器级 ID,
     // 即使 token 走快照,设备也必须是指定的独立设备,否则与主账号共用触发设备维限额。
@@ -185,14 +412,13 @@ fn auth_headers(cred: &Credential) -> reqwest::header::HeaderMap {
     h
 }
 
-/// 手动刷新账号凭证:仅从实例目录回读最新凭据(TRAE 客户端运行时会自行刷新 token 并写回
-/// storage.json),采纳更新凭据回写应用存储。应用自身不调 ExchangeToken 刷新。
+/// 手动刷新账号凭证:回读实例目录最新凭据;token 已过期/临近过期且有刷新令牌时,主动调
+/// ExchangeToken 续期(自动刷新,解决约 7 天过期需手动重登),采纳后回写实例目录与应用存储。
 pub async fn refresh_account_credential(
     account: &Account,
     client: &reqwest::Client,
     state: &AppState,
 ) -> AppResult<Credential> {
-    let _ = client;
     let encrypted = account
         .encrypted_credential
         .as_ref()
@@ -202,13 +428,58 @@ pub async fn refresh_account_credential(
     let (synced, adopted) = crate::trae_instance::sync_credential_from_instance(account, &cred);
     if synced.expires_at > now_ms() || adopted {
         persist_credential(state, account, &synced);
-        Ok(synced)
-    } else {
+    }
+    let now = now_ms();
+    // 自动刷新:token 已过期/临近过期且刷新令牌仍有效 → ExchangeToken 续期并回写
+    if !synced.refresh_token.is_empty()
+        && synced.refresh_expires_at > now
+        && synced.expires_at <= now + AUTO_REFRESH_BEFORE_MS
+    {
+        let fresh = exchange_token_refresh(&synced, client).await?;
+        crate::trae_instance::write_back_auth_to_instance(account, &fresh);
+        persist_credential(state, account, &fresh);
+        return Ok(fresh);
+    }
+    if synced.expires_at <= now {
         mark_credential_expired(state, &account.id);
         Err(AppError::Credential(
             "token 已过期，请打开该账号的 TRAE 实例（TRAE 会自动刷新），刷新后重试".into(),
         ))
+    } else {
+        Ok(synced)
     }
+}
+
+/// 强制刷新账号 token(手动调试/续期按钮):无论当前 token 是否过期,一律调 ExchangeToken
+/// 续期并回写实例目录与应用存储。返回详细结果(新有效期/设备信息),便于定位刷新链路问题
+/// (如 20403 设备不匹配时,错误信息会带上 code/msg/设备 ID)。
+pub async fn force_refresh_account_token(
+    account: &Account,
+    client: &reqwest::Client,
+    state: &AppState,
+) -> AppResult<Value> {
+    let encrypted = account
+        .encrypted_credential
+        .as_ref()
+        .ok_or_else(|| AppError::Credential("该账号尚未导入 TRAE 桌面凭证".into()))?;
+    let mut cred = decrypt_credential(encrypted)?;
+    // 回读实例目录最新凭据:客户端可能已自行刷新过,用最新 refresh_token 发起刷新
+    let (synced, adopted) = crate::trae_instance::sync_credential_from_instance(account, &cred);
+    if synced.expires_at > now_ms() || adopted {
+        persist_credential(state, account, &synced);
+        cred = synced;
+    }
+    let fresh = exchange_token_refresh(&cred, client).await?;
+    crate::trae_instance::write_back_auth_to_instance(account, &fresh);
+    persist_credential(state, account, &fresh);
+    Ok(json!({
+        "success": true,
+        "message": "token 刷新成功",
+        "expiresAt": fresh.expires_at,
+        "refreshExpiresAt": fresh.refresh_expires_at,
+        "deviceId": cred.device_id,
+        "machineId": cred.machine_id,
+    }))
 }
 
 /// 单账号签到(桌面凭据模式):凭据由 get_valid_credential 回读自 TRAE 实例目录,
@@ -218,7 +489,7 @@ pub async fn checkin_by_desktop(
     client: &reqwest::Client,
     state: &AppState,
 ) -> CheckinResult {
-    let cred = match get_valid_credential(account, state).await {
+    let cred = match get_valid_credential(account, client, state).await {
         Ok(c) => c,
         Err(e) => {
             return CheckinResult {
@@ -226,6 +497,7 @@ pub async fn checkin_by_desktop(
                 message: e.to_string(),
                 error_code: None,
                 points: None,
+points_extra: None,
                 trace: None,
             }
         }
@@ -241,6 +513,7 @@ pub async fn checkin_by_desktop(
         message: "签到接口鉴权失败(token 已失效)，请打开该账号的 TRAE 实例让客户端刷新后再试".into(),
         error_code: None,
         points: None,
+points_extra: None,
         trace: None,
     }
 }
@@ -253,7 +526,7 @@ pub async fn force_checkin_by_desktop(
     client: &reqwest::Client,
     state: &AppState,
 ) -> CheckinResult {
-    let cred = match get_valid_credential(account, state).await {
+    let cred = match get_valid_credential(account, client, state).await {
         Ok(c) => c,
         Err(e) => {
             return CheckinResult {
@@ -261,6 +534,7 @@ pub async fn force_checkin_by_desktop(
                 message: e.to_string(),
                 error_code: None,
                 points: None,
+points_extra: None,
                 trace: None,
             }
         }
@@ -275,6 +549,7 @@ pub async fn force_checkin_by_desktop(
         message: "签到接口鉴权失败(token 已失效)，请打开该账号的 TRAE 实例让客户端刷新后再试".into(),
         error_code: None,
         points: None,
+points_extra: None,
         trace: None,
     }
 }
@@ -304,6 +579,7 @@ async fn force_checkin_once(cred: &Credential, client: &reqwest::Client) -> (Che
                     message: format!("TRAE 桌面端强制签到失败: {e}"),
                     error_code: None,
                     points: None,
+points_extra: None,
                     trace: Some(trace_to_string(&trace)),
                 },
                 false,
@@ -320,6 +596,7 @@ async fn force_checkin_once(cred: &Credential, client: &reqwest::Client) -> (Che
                     message: format!("解析签到结果失败: {e}"),
                     error_code: None,
                     points: None,
+points_extra: None,
                     trace: Some(trace_to_string(&trace)),
                 },
                 false,
@@ -349,6 +626,7 @@ async fn force_checkin_once(cred: &Credential, client: &reqwest::Client) -> (Che
                 message: "签到接口鉴权失败(token 已失效)".into(),
                 error_code: extract_error_code(Some(&claim_data)),
                 points: None,
+points_extra: None,
                 trace: Some(trace_to_string(&trace)),
             },
             true,
@@ -367,18 +645,17 @@ async fn force_checkin_once(cred: &Credential, client: &reqwest::Client) -> (Che
                 None => "强制签到成功".to_string(),
             }
         };
-        let points = claim_data
-            .get("data")
-            .and_then(|d| d.get("points"))
-            .and_then(|v| v.as_i64())
-            .or_else(|| claim_data.get("points").and_then(|v| v.as_i64()))
-            .or(Some(200));
+        // 本次获得积分拆为 (每日基础 credits, 额外加成 extra_credits),claim 响应缺失时回退 status 步骤。
+        let (points, points_extra) = extract_earned_points(&claim_data, &trace)
+            .map(|(b, e)| (Some(b), Some(e)))
+            .unwrap_or((None, None));
         (
             CheckinResult {
                 success: true,
                 message: msg,
                 error_code: extract_error_code(Some(&claim_data)),
                 points,
+                points_extra,
                 trace: Some(trace_to_string(&trace)),
             },
             false,
@@ -397,6 +674,7 @@ async fn force_checkin_once(cred: &Credential, client: &reqwest::Client) -> (Che
                 message: device_msg(&raw_msg, code),
                 error_code: code,
                 points: None,
+points_extra: None,
                 trace: Some(trace_to_string(&trace)),
             },
             false,
@@ -472,6 +750,93 @@ fn trace_to_string(entries: &[ApiTraceEntry]) -> String {
     serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// 提取本次签到获得的积分,返回 (每日基础 credits, 额外加成 extra_credits)。
+/// claim 响应缺失该字段时,回退读取流程中 status 步骤的响应(每次签到都会先查 status)。
+fn extract_earned_points(claim: &Value, trace: &[ApiTraceEntry]) -> Option<(i64, i64)> {
+    let read = |v: &Value| -> Option<(i64, i64)> {
+        let data = v.get("data");
+        let base = data
+            .and_then(|d| d.get("credits").or_else(|| d.get("points")))
+            .or_else(|| v.get("credits").or_else(|| v.get("points")))
+            .and_then(|x| x.as_i64());
+        base.map(|b| {
+            let extra = data
+                .and_then(|d| d.get("extra_credits"))
+                .or_else(|| v.get("extra_credits"))
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0);
+            (b, extra)
+        })
+    };
+    if let Some(p) = read(claim) {
+        return Some(p);
+    }
+    trace.iter().find(|s| s.name == "status").and_then(|s| read(&s.response))
+}
+
+#[cfg(test)]
+mod earned_points_tests {
+    use super::*;
+
+    #[test]
+    fn extract_earned_points_from_status_fallback() {
+        // claim 响应无 credits 时,回退读取 status 步骤响应(真实账号响应样例)
+        let claim = serde_json::json!({ "code": 0, "message": "success" });
+        let trace = [
+            ApiTraceEntry {
+                name: "status",
+                method: "POST",
+                url: "https://api.trae.cn/trae/api/v1/checkin/status".into(),
+                headers: json!({}),
+                request: json!({}),
+                http_status: 200,
+                response: serde_json::json!({
+                    "checked_in": true,
+                    "code": 0,
+                    "credits": 150,
+                    "did_checked_in": true,
+                    "enable": true,
+                    "extra_credits": 50,
+                    "message": "success"
+                }),
+            },
+            ApiTraceEntry {
+                name: "claim",
+                method: "POST",
+                url: "https://api.trae.cn/trae/api/v1/checkin/claim".into(),
+                headers: json!({}),
+                request: json!({}),
+                http_status: 200,
+                response: claim.clone(),
+            },
+        ];
+        assert_eq!(extract_earned_points(&claim, &trace), Some((150, 50)));
+    }
+
+    #[test]
+    fn extract_earned_points_prefers_claim() {
+        // claim 响应带 credits 时以 claim 为准,不读 status
+        let claim = serde_json::json!({ "code": 0, "credits": 120, "extra_credits": 30 });
+        let trace = [];
+        assert_eq!(extract_earned_points(&claim, &trace), Some((120, 30)));
+    }
+
+    #[test]
+    fn extract_earned_points_extra_zero_when_missing() {
+        // 响应只有 credits 没有 extra_credits 时,额外加成为 0
+        let claim = serde_json::json!({ "code": 0, "credits": 100 });
+        let trace = [];
+        assert_eq!(extract_earned_points(&claim, &trace), Some((100, 0)));
+    }
+
+    #[test]
+    fn extract_earned_points_none_when_missing() {
+        let claim = serde_json::json!({ "code": 0, "message": "success" });
+        let trace = [];
+        assert_eq!(extract_earned_points(&claim, &trace), None);
+    }
+}
+
 /// 用给定凭据执行一次签到(查询状态 -> 领取)。返回 (结果, 是否疑似鉴权失败)。
 /// 同时采集每一步接口的出入参(请求/响应),写入结果的 trace 字段供前端展示。
 async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinResult, bool) {
@@ -497,6 +862,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                     message: format!("TRAE 桌面端签到失败: {e}"),
                     error_code: None,
                     points: None,
+points_extra: None,
                     trace: None,
                 },
                 false,
@@ -513,6 +879,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                     message: format!("解析签到状态失败: {e}"),
                     error_code: None,
                     points: None,
+points_extra: None,
                     trace: None,
                 },
                 false,
@@ -542,6 +909,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 message: "签到接口鉴权失败(token 已失效)".into(),
                 error_code: extract_error_code(Some(&status_data)),
                 points: None,
+points_extra: None,
                 trace: Some(trace_to_string(&trace)),
             },
             true,
@@ -559,6 +927,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 message: ALREADY_CHECKED_IN.into(),
                 error_code: extract_error_code(Some(&status_data)),
                 points: None,
+points_extra: None,
                 trace: Some(trace_to_string(&trace)),
             },
             false,
@@ -578,6 +947,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 message: device_msg(&raw_msg, code),
                 error_code: code,
                 points: None,
+points_extra: None,
                 trace: Some(trace_to_string(&trace)),
             },
             false,
@@ -603,6 +973,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                     message: format!("TRAE 桌面端签到失败: {e}"),
                     error_code: None,
                     points: None,
+points_extra: None,
                     trace: Some(trace_to_string(&trace)),
                 },
                 false,
@@ -619,6 +990,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                     message: format!("解析签到结果失败: {e}"),
                     error_code: None,
                     points: None,
+points_extra: None,
                     trace: Some(trace_to_string(&trace)),
                 },
                 false,
@@ -648,6 +1020,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 message: "签到接口鉴权失败(token 已失效)".into(),
                 error_code: extract_error_code(Some(&claim_data)),
                 points: None,
+points_extra: None,
                 trace: Some(trace_to_string(&trace)),
             },
             true,
@@ -666,18 +1039,17 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 None => "签到成功".to_string(),
             }
         };
-        let points = claim_data
-            .get("data")
-            .and_then(|d| d.get("points"))
-            .and_then(|v| v.as_i64())
-            .or_else(|| claim_data.get("points").and_then(|v| v.as_i64()))
-            .or(Some(200));
+        // 本次获得积分拆为 (每日基础 credits, 额外加成 extra_credits),claim 响应缺失时回退 status 步骤。
+        let (points, points_extra) = extract_earned_points(&claim_data, &trace)
+            .map(|(b, e)| (Some(b), Some(e)))
+            .unwrap_or((None, None));
         (
             CheckinResult {
                 success: true,
                 message: msg,
                 error_code: extract_error_code(Some(&claim_data)),
                 points,
+                points_extra,
                 trace: Some(trace_to_string(&trace)),
             },
             false,
@@ -696,6 +1068,7 @@ async fn checkin_once(cred: &Credential, client: &reqwest::Client) -> (CheckinRe
                 message: device_msg(&raw_msg, code),
                 error_code: code,
                 points: None,
+points_extra: None,
                 trace: Some(trace_to_string(&trace)),
             },
             false,
@@ -849,7 +1222,7 @@ pub async fn get_total_points(
     client: &reqwest::Client,
     state: &AppState,
 ) -> PointsResult {
-    let cred = match get_valid_credential(account, state).await {
+    let cred = match get_valid_credential(account, client, state).await {
         Ok(c) => c,
         Err(e) => {
             return PointsResult {
@@ -1043,10 +1416,12 @@ async fn perform_checkin_inner(
     };
 
     let now = now_ms();
-    let new_points = match (result.points, account.points) {
-        (Some(gained), Some(base)) => Some(base + gained),
-        (Some(gained), None) => Some(gained),
-        (None, base) => base,
+    // 余额只用服务端真实查询值,不做本地 +gained 累加估算,避免漂移/虚数
+    let (real_points, points_update) = if result.success {
+        let pr = get_total_points(account, client, state).await;
+        (pr.total_points, points_update_json(&pr))
+    } else {
+        (None, serde_json::Value::Null)
     };
     // 三态:成功签到 / 今日已签到 / 失败
     let status = if result.success && result.message == ALREADY_CHECKED_IN {
@@ -1057,16 +1432,26 @@ async fn perform_checkin_inner(
         "failed"
     };
     let mut data = state.data.lock().unwrap();
-    data.update_account(
-        &account.id,
-        json!({
-            "lastCheckinAt": now,
-            "lastCheckinResult": status,
-            "lastCheckinMessage": result.message,
-            "lastCheckinTrace": result.trace,
-            "points": new_points,
-        }),
-    );
+    let mut acc_upd = json!({
+        "lastCheckinAt": now,
+        "lastCheckinResult": status,
+        "lastCheckinMessage": result.message,
+        "lastCheckinTrace": result.trace,
+    });
+    if let Some(tp) = real_points {
+        acc_upd["points"] = json!(tp);
+        // 合并 points_details / points_response 等真实积分详情
+        if let serde_json::Value::Object(pu) = &points_update {
+            if let Some(obj) = acc_upd.as_object_mut() {
+                for (k, v) in pu {
+                    if k != "points" {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+    }
+    data.update_account(&account.id, acc_upd);
     data.add_log(CheckinLog {
         id: generate_id(),
         account_id: account.id.clone(),
@@ -1076,7 +1461,8 @@ async fn perform_checkin_inner(
         message: result.message.clone(),
         error_code: result.error_code,
         points_gained: result.points,
-        points_balance: new_points,
+        points_extra: result.points_extra,
+        points_balance: real_points,
     });
     let _ = data.save(&state.path);
     drop(data);
@@ -1137,6 +1523,7 @@ pub(crate) async fn run_all_checkin(
                         message: last_err.clone(),
                         error_code: last_code,
                         points: None,
+points_extra: None,
                         trace: r.trace,
                     });
                     break;
@@ -1152,6 +1539,7 @@ pub(crate) async fn run_all_checkin(
                     message: last_err,
                     error_code: last_code,
                     points: None,
+points_extra: None,
                     trace: None,
                 },
             };
@@ -1207,6 +1595,45 @@ mod tests {
             200,
             Some(&json!({ "message": "操作太过频繁啦，请稍后尝试" }))
         ));
+    }
+
+    #[test]
+    fn device_proof_signature_verifies_with_public_key() {
+        // 与客户端 qDe 一致:EC P-256 私钥对 message 做 ECDSA-SHA256 签名,输出 DER 编码后 base64。
+        // 用公钥验证 DER 签名,确保格式正确(可被服务端验签)。
+        use ecdsa::signature::Verifier;
+        use p256::ecdsa::{Signature as EcdsaSignature, VerifyingKey};
+        use p256::pkcs8::{
+            DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding,
+        };
+
+        let secret = p256::SecretKey::random(&mut rand::thread_rng());
+        let private_pem = secret
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let public_key = secret.public_key();
+        let verifying: VerifyingKey = VerifyingKey::from(&public_key);
+        let public_pem = verifying.to_public_key_pem(LineEnding::LF).unwrap();
+        // 走真实签名入口(解析 PEM → 签名 → base64 DER)
+        let (sig_b64, timestamp, nonce) = device_proof(
+            "POST",
+            EXCHANGE_TOKEN_PATH,
+            CLIENT_ID_SOLO,
+            "test-refresh-token",
+            &private_pem,
+        )
+        .expect("device_proof 应成功");
+        let message = format!(
+            "POST\n{}\n{}\ntest-refresh-token\n{}\n{}",
+            EXCHANGE_TOKEN_PATH, CLIENT_ID_SOLO, timestamp, nonce
+        );
+        let pub_key = VerifyingKey::from_public_key_pem(&public_pem).unwrap();
+        let sig_bytes = general_purpose::STANDARD.decode(&sig_b64).unwrap();
+        let sig = EcdsaSignature::from_der(&sig_bytes).unwrap();
+        pub_key
+            .verify(message.as_bytes(), &sig)
+            .expect("签名应能被公钥验证(与客户端 ECDSA-SHA256 一致)");
     }
 }
 
@@ -1488,6 +1915,7 @@ mod e2e_tests {
                 accounts: vec![account.clone()],
                 logs: vec![],
                 settings: Default::default(),
+                account_order: vec![],
             }),
             path: std::env::temp_dir().join("trae-check-e2e-test.json"),
         };
@@ -1498,5 +1926,59 @@ mod e2e_tests {
             result.success, result.message, result.points
         );
         assert!(result.success, "签到失败: {}", result.message);
+    }
+
+    /// 诊断:真实调用 ExchangeToken 刷新主账号 token(仅手动 --ignored 运行,会轮换 token)。
+    /// 验证 ClientID/签名/请求体/响应解析与 TRAE 客户端一致。
+    #[tokio::test]
+    #[ignore]
+    async fn e2e_exchange_token_refresh_real() {
+        let cred = match crate::trae_auth::get_trae_desktop_credentials() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[e2e] 未读取到 TRAE 桌面凭据: {e}");
+                return;
+            }
+        };
+        eprintln!(
+            "[e2e] 刷新前: host={} dev={} machine={} uid={} exp={} now={} refresh_exp={}",
+            cred.host,
+            cred.device_id,
+            cred.machine_id,
+            cred.user_id,
+            cred.expires_at,
+            now_ms(),
+            cred.refresh_expires_at
+        );
+        let client = reqwest::Client::new();
+        // 循环尝试不同的 DeviceID/MachineID 组合,定位 20403 设备不匹配的根因
+        let candidates: Vec<(String, String)> = vec![
+            (cred.device_id.clone(), cred.machine_id.clone()),
+            (cred.machine_id.clone(), cred.machine_id.clone()),
+            (cred.machine_id.clone(), cred.device_id.clone()),
+            (cred.device_id.clone(), cred.device_id.clone()),
+            (String::new(), cred.machine_id.clone()),
+        ];
+        let mut last_err = String::new();
+        for (dev, machine) in candidates {
+            let mut c = cred.clone();
+            c.device_id = dev;
+            c.machine_id = machine;
+            match exchange_token_refresh(&c, &client).await {
+                Ok(f) => {
+                    eprintln!(
+                        "[e2e] 刷新成功! DeviceID={} MachineID={} 新exp={} refresh_exp={}",
+                        c.device_id, c.machine_id, f.expires_at, f.refresh_expires_at
+                    );
+                    assert!(f.token != cred.token, "token 应已轮换");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("[e2e] 失败 DeviceID={} MachineID={}: {e}", c.device_id, c.machine_id);
+                    last_err = e.to_string();
+                }
+            }
+        }
+        assert!(false, "所有组合均刷新失败,最后错误: {last_err}");
     }
 }

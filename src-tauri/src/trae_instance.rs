@@ -244,13 +244,15 @@ fn inject_isolated_aha_device(json: &mut Map<String, Value>, data_path: &Path) -
     (Some(new_dev), true)
 }
 
-/// 读取实例目录当前 aha 设备ID(icube-dc key 后缀)。只读,不修改客户端文件。
-/// 目录不存在/未登录/未迁移时返回 None。
+/// 读取实例目录当前 aha 设备ID。客户端 2.3.78099+ 以 ahanet/tt_net_config.config 的
+/// device_id 作为设备身份来源,优先取它(与 token 绑定设备一致);回退 storage 第一个
+/// icube-dc 键。目录不存在/未登录/未迁移时返回 None。只读,不修改客户端文件。
 pub fn read_instance_aha_device(data_dir: &str) -> Option<String> {
-    let storage_path = PathBuf::from(data_dir)
-        .join("User")
-        .join("globalStorage")
-        .join("storage.json");
+    let path = PathBuf::from(data_dir);
+    if let Some(dev) = crate::trae_auth::read_tt_net_device_id(&path) {
+        return Some(dev);
+    }
+    let storage_path = path.join("User").join("globalStorage").join("storage.json");
     let raw = fs::read_to_string(&storage_path).ok()?;
     let json: Value = serde_json::from_str(&raw).ok()?;
     json.as_object()?
@@ -500,6 +502,41 @@ pub fn sync_credential_from_instance(account: &Account, cred: &Credential) -> (C
         }
     }
     (best, adopted)
+}
+
+/// 自动刷新 token 后回写实例目录 storage.json 的 iCubeAuthInfo 键,使客户端下次启动
+/// 直接用新 token,不会因旧 token 过期而强制要求重新登录(重登会把设备重置回机器级)。
+/// 只更新加密的 iCubeAuthInfo 键,绝不触碰 icube-dc 设备键(遵守覆盖红线);失败静默,
+/// 不阻断签到。userId 不匹配的目录跳过,避免覆盖他人登录。
+pub fn write_back_auth_to_instance(account: &Account, cred: &Credential) {
+    let Ok(auth_plain) = serde_json::to_string(&build_auth_info(cred)) else {
+        return;
+    };
+    let Ok(auth_encrypted) = encrypt_trae_auth_info(&auth_plain) else {
+        return;
+    };
+    for dir in candidate_dirs(account) {
+        let storage_path = PathBuf::from(&dir)
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        let Ok(content) = fs::read_to_string(&storage_path) else {
+            continue;
+        };
+        let Ok(mut json) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let Some(obj) = json.as_object_mut() else {
+            continue;
+        };
+        obj.insert(
+            "iCubeAuthInfo://icube.cloudide".into(),
+            Value::String(auth_encrypted.clone()),
+        );
+        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+            let _ = fs::write(&storage_path, pretty);
+        }
+    }
 }
 
 /// 已有多开目录的扫描结果(返回前端)

@@ -754,6 +754,22 @@ pub async fn refresh_account_credential(
     Ok(acc.into())
 }
 
+/// 强制刷新账号 token(调试/手动续期按钮):无条件调 ExchangeToken 续期并回写,
+/// 返回新有效期与设备信息;失败时错误信息含服务端 code/msg,便于定位 20403 等设备问题。
+#[tauri::command]
+pub async fn refresh_account_token(
+    id: String,
+    state: State<'_, AppState>,
+    client: State<'_, reqwest::Client>,
+) -> AppResult<serde_json::Value> {
+    let account = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts().iter().find(|a| a.id == id).cloned()
+    }
+    .ok_or_else(|| AppError::NotFound(id.clone()))?;
+    checkin::force_refresh_account_token(&account, client.inner(), state.inner()).await
+}
+
 /// 扫描 %APPDATA% 下已存在的多开/登录临时目录,标注是否已绑定应用内账号
 #[tauri::command]
 pub fn scan_instance_dirs(state: State<'_, AppState>) -> Vec<trae_instance::InstanceDirInfo> {
