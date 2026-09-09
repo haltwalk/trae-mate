@@ -66,8 +66,7 @@
           <div class="col-account">账号</div>
           <div class="col-result">结果</div>
           <div class="col-message">详情</div>
-          <div class="col-gained">每日积分</div>
-          <div class="col-extra">额外加成</div>
+          <div class="col-gained">获得积分</div>
           <div class="col-points">可用积分</div>
         </div>
         <div class="log-body">
@@ -96,13 +95,7 @@
             </div>
             <div class="col-gained">
               <template v-if="log.pointsGained != null">
-                <span class="points-gained" :title="`每日基础积分(credits)`">+{{ log.pointsGained }}</span>
-              </template>
-              <span v-else class="points-none">-</span>
-            </div>
-            <div class="col-extra">
-              <template v-if="log.pointsExtra != null && log.pointsExtra > 0">
-                <span class="points-extra" :title="`额外加成积分(extra_credits)`">+{{ log.pointsExtra }}</span>
+                <span class="points-gained" :title="`本次到账积分(credits)`">+{{ log.pointsGained }}</span>
               </template>
               <span v-else class="points-none">-</span>
             </div>
@@ -166,12 +159,8 @@
               <span class="detail-value detail-msg">{{ detail.message }}</span>
             </div>
             <div class="detail-row" v-if="detail.pointsGained != null">
-              <span class="detail-label">每日积分</span>
+              <span class="detail-label">获得积分</span>
               <span class="detail-value">{{ detail.pointsGained }} 分</span>
-            </div>
-            <div class="detail-row" v-if="detail.pointsExtra != null && detail.pointsExtra > 0">
-              <span class="detail-label">额外加成</span>
-              <span class="detail-value">{{ detail.pointsExtra }} 分</span>
             </div>
             <div class="detail-row" v-if="detail.pointsBalance != null">
               <span class="detail-label">可用余额</span>
@@ -457,17 +446,6 @@ onMounted(() => {
 
 .points-gained {
   color: var(--success);
-  font-weight: 700;
-}
-
-.col-extra {
-  width: 90px;
-  flex-shrink: 0;
-  text-align: right;
-}
-
-.points-extra {
-  color: var(--accent);
   font-weight: 700;
 }
 
