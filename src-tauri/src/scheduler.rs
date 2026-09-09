@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono_tz::Asia::Shanghai;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::checkin::perform_all_checkin;
@@ -133,6 +133,10 @@ async fn run_auto_checkin(app: AppHandle) {
             let _ = data.save(&state.inner().path);
         }
     }
+
+    // 通知前端刷新(定时签到是后台任务,前端不知积分/签到状态变化;手动签到走前端调用,
+    // 返回后前端自行 fetchAccounts,不受影响)。同时刷新日志列表。
+    let _ = app.emit("accounts-updated", ());
 
     let success = results.iter().filter(|(_, r)| r.success).count();
     let failed = results.len() - success;

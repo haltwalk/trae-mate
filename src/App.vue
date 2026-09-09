@@ -231,6 +231,12 @@ onMounted(() => {
       showToast(`导入失败: ${p.error || '未知错误'}`, 'error')
     }
   })
+  // 监听定时自动签到完成(后台任务,后端落库后 emit),刷新账号数据、日志与下次运行时间
+  listen('accounts-updated', () => {
+    store.fetchAccounts()
+    store.fetchLogs()
+    store.fetchNextRunTime()
+  })
 })
 </script>
 
