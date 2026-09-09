@@ -67,6 +67,7 @@
           <div class="col-result">结果</div>
           <div class="col-message">详情</div>
           <div class="col-gained">获得积分</div>
+          <div class="col-before">签到前积分</div>
           <div class="col-points">可用积分</div>
         </div>
         <div class="log-body">
@@ -96,6 +97,12 @@
             <div class="col-gained">
               <template v-if="log.pointsGained != null">
                 <span class="points-gained" :title="`本次到账积分(credits)`">+{{ log.pointsGained }}</span>
+              </template>
+              <span v-else class="points-none">-</span>
+            </div>
+            <div class="col-before">
+              <template v-if="log.pointsBalance != null && log.pointsGained != null">
+                <span class="points-before" :title="`签到前可用积分 = 可用积分 - 获得积分`">{{ log.pointsBalance - log.pointsGained }}</span>
               </template>
               <span v-else class="points-none">-</span>
             </div>
@@ -161,6 +168,10 @@
             <div class="detail-row" v-if="detail.pointsGained != null">
               <span class="detail-label">获得积分</span>
               <span class="detail-value">{{ detail.pointsGained }} 分</span>
+            </div>
+            <div class="detail-row" v-if="detail.pointsBalance != null && detail.pointsGained != null">
+              <span class="detail-label">签到前积分</span>
+              <span class="detail-value">{{ detail.pointsBalance - detail.pointsGained }} 分</span>
             </div>
             <div class="detail-row" v-if="detail.pointsBalance != null">
               <span class="detail-label">可用余额</span>
@@ -447,6 +458,17 @@ onMounted(() => {
 .points-gained {
   color: var(--success);
   font-weight: 700;
+}
+
+.col-before {
+  width: 110px;
+  flex-shrink: 0;
+  text-align: right;
+}
+
+.points-before {
+  color: var(--text-secondary);
+  font-weight: 600;
 }
 
 .col-points {
