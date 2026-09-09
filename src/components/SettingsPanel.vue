@@ -275,7 +275,7 @@
       <div class="about-info">
         <div class="about-row">
           <span class="about-label">版本</span>
-          <span class="about-value">v1.1.0</span>
+          <span class="about-value">v{{ appVersion }}</span>
         </div>
         <div class="about-row">
           <span class="about-label">技术栈</span>
@@ -305,18 +305,26 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
+import { getVersion } from '@tauri-apps/api/app'
 import { useAppStore } from '../stores/app'
 import Icon from './Icon.vue'
 
 const store = useAppStore()
 const emit = defineEmits(['notify'])
 
+// 应用版本号(动态读取打包配置,避免硬编码过期)
+const appVersion = ref('')
 // 多开实例 TRAE 客户端路径
 const traeExePath = ref<string | null>(null)
 const pathBusy = ref<'' | 'scan' | 'choose'>('')
 
 onMounted(async () => {
   traeExePath.value = await store.getTraeExePath()
+  try {
+    appVersion.value = await getVersion()
+  } catch {
+    appVersion.value = '未知'
+  }
 })
 
 async function scanTraePath() {
