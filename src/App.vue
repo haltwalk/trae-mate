@@ -17,6 +17,7 @@
         <div class="logo">
           <span class="logo-icon"><Icon name="check" :size="20" /></span>
           <span class="logo-text">TraeMate</span>
+          <span class="ver-pill">v{{ appVersion }}</span>
         </div>
         <p class="logo-desc">签到与多开账号管理</p>
       </div>
@@ -138,6 +139,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { listen } from '@tauri-apps/api/event'
+import { getVersion } from '@tauri-apps/api/app'
 import { useAppStore } from './stores/app'
 import AccountList from './components/AccountList.vue'
 import CheckinLog from './components/CheckinLog.vue'
@@ -151,6 +153,9 @@ const showAddModal = ref(false)
 const toastMessage = ref('')
 const toastType = ref<'success' | 'error'>('success')
 let toastTimer: ReturnType<typeof setTimeout> | undefined
+
+// 应用版本号(侧边栏常驻显示,一眼可见)
+const appVersion = ref('')
 
 function showToast(message: string, type: 'success' | 'error' = 'success') {
   toastMessage.value = message
@@ -216,6 +221,7 @@ async function handleRefresh() {
 
 onMounted(() => {
   store.init()
+  getVersion().then(v => { appVersion.value = v }).catch(() => { appVersion.value = '未知' })
   // 监听系统托盘"一键签到"菜单
   listen('tray-checkin', () => {
     handleCheckinAll()
@@ -371,6 +377,20 @@ onMounted(() => {
   font-weight: 800;
   letter-spacing: 0.2px;
   color: var(--text-primary);
+}
+
+/* 版本徽标 - logo 旁常驻,一眼可见 */
+.ver-pill {
+  font-family: 'Nunito', 'Inter', sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--surface);
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  box-shadow: var(--shadow-soft-inset);
+  margin-left: auto;
+  flex-shrink: 0;
 }
 
 .logo-desc {
