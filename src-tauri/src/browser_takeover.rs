@@ -43,7 +43,8 @@ type BackSpec = (String, Option<String>);
 /// 优先读 UserChoice(HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\{proto}\UserChoice\ProgId),
 /// 因为用户设了默认浏览器后,http/https 打开走 UserChoice 指向的 ProgId(如 MSEdgeHTM/ChromeHTML)。
 /// 无 UserChoice 时才退回 `Software\Classes\{proto}` 本身。
-/// 返回 (命令子键路径, 当前值)。
+/// 返回 (命令子键路径, 当前生效值)。生效值解析与 Windows 一致:HKCU 覆盖值优先,
+/// 没有或为 capture 残留时回退取 HKLM 系统真实命令(避免把残留 capture 当原始值备份)。
 fn handler_target(proto: &str) -> (String, Option<String>) {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     // 1) UserChoice 默认浏览器
@@ -58,15 +59,17 @@ fn handler_target(proto: &str) -> (String, Option<String>) {
             // 关键:如果 HKCU 里是我们上次残留的 capture 命令(HKCU 覆盖拦截),
             // 绝不能把它当"原始值"备份(否则恢复会写回 capture 命令导致自引用残留)。
             // 此时丢弃 HKCU 值,回退取 HKLM 系统真实命令作为原始值。
-            if !is_capture_command(cur.as_deref()) {
-                return (cmd_key, cur);
-            }
-            // HKCU 没覆盖·或是 capture 残留 → 取系统真实命令
-            let cur_system = system_command(&progid);
-            return (cmd_key, cur_system);
+            let cur = if is_capture_command(cur.as_deref()) {
+                None
+            } else {
+                cur
+            };
+            // 实际生效值:HKCU 优先;HKCU 无值时回退 HKLM(HKCR 合并视图,与 Windows 解析一致)
+            let effective = cur.or_else(|| system_command(&progid));
+            return (cmd_key, effective);
         }
     }
-    // 2) 无 UserChoice,退回协议本身
+    // 2) 无 UserChoice,退回协议本身,同样回退系统级命令
     let cmd_key = handler_key(proto);
     let cur = ref_command(&cmd_key);
     let cur = if is_capture_command(cur.as_deref()) {
@@ -74,7 +77,13 @@ fn handler_target(proto: &str) -> (String, Option<String>) {
     } else {
         cur
     };
-    (cmd_key, cur)
+    let effective = cur.or_else(|| {
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        hklm.open_subkey(&cmd_key)
+            .ok()
+            .and_then(|k| k.get_value::<String, _>("").ok())
+    });
+    (cmd_key, effective)
 }
 
 /// 判断命令是否本程序用于浏览器接管的 capture 命令(残留检测)。
@@ -452,7 +461,7 @@ mod tests {
 
     /// 端到端:安装->校验覆盖->恢复->校验还原。
     /// 会真实改写 UserChoice 指向的默认浏览器(Firefox/Chrome)的 open 命令,
-    /// 但"立即恢复"在任一断言前执行,保证测试即使失败也不污染真实浏览器。
+    /// 但"立即恢复"由 guard 兜底,保证即使断言失败也恢复,不污染真实浏览器。
     #[test]
     fn takeover_install_restore_pipeline() {
         let temp_dir = std::env::temp_dir().join("traemate_takeover_test");
@@ -463,16 +472,25 @@ mod tests {
         assert!(orig_https.is_some(), "应能解析到默认浏览器");
 
         let backups = install_takeover(&temp_str);
+        // guard:任何 panic(断言失败/异常)都会在 drop 时按备份恢复注册表
+        struct Guard(Vec<BackSpec>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                restore_takeover(&self.0);
+            }
+        }
+        let _guard = Guard(backups.clone());
         persist_backup_to(&temp_str, &backups).expect("备份写盘失败");
-        let hijacked_https = current_handler("https").unwrap_or_default();
 
-        // 校验当前 handler 指向本程序 CAPTURE_FLAG
+        // 校验劫持:直接读被改写的 HKCU 命令值。不要用 current_handler——它会识别
+        // capture 命令并回退到系统(HKLM)命令,导致劫持状态被误判为"未生效"。
+        let hijacked_https = ref_command(&handler_target("https").0).unwrap_or_default();
         assert!(
             hijacked_https.contains(crate::browser_takeover::CAPTURE_FLAG),
             "劫持后 https handler 应为捕获命令,实际={hijacked_https}"
         );
 
-        // 恢复(通过备份文件,模拟子进程路径)——在任何可能失败的断言之前执行
+        // 恢复(通过备份文件,模拟子进程路径)——guard 已兜底,这里走正常业务路径
         let restored = restore_from_backup(&temp_str);
         assert!(restored, "恢复应从备份成功");
         // 校验还原
